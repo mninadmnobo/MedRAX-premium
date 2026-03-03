@@ -54,16 +54,16 @@ class AbstentionLogic:
     """
     
     # Thresholds for abstention decisions
-    CLOSE_VOTE_THRESHOLD = 0.2         # If gap < 0.2, vote is "too close"
-    UNCERTAINTY_THRESHOLD = 0.6        # If certainty < 0.6, "too uncertain"
-    CRITICAL_CERTAINTY_THRESHOLD = 0.8 # Higher bar for critical conditions
+    CLOSE_VOTE_THRESHOLD = 0.12        # If gap < 0.12, vote is "too close" (relaxed for 2-tool setups)
+    UNCERTAINTY_THRESHOLD = 0.52       # If certainty < 0.52, "too uncertain" (was 0.6 — unrealistic with 2 tools)
+    CRITICAL_CERTAINTY_THRESHOLD = 0.6 # Higher bar for critical conditions (was 0.8 — impossible with only 2 mid-confidence tools)
     MIN_TOOLS_REPORTING = 2            # Need at least 2 tools to make decision
     
     def __init__(
         self,
-        close_vote_thr: float = 0.2,
-        uncertainty_thr: float = 0.6,
-        critical_certainty_thr: float = 0.8,
+        close_vote_thr: float = 0.12,
+        uncertainty_thr: float = 0.52,
+        critical_certainty_thr: float = 0.6,
         min_tools: int = 2
     ):
         """

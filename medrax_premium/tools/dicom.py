@@ -132,12 +132,14 @@ class DicomProcessorTool(BaseTool):
             return output, metadata
 
         except Exception as e:
+            err_msg = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__}: {e!r}"
+            print(f"  ❌ DICOM error: {err_msg}")
             return (
-                {"error": str(e)},
+                {"error": err_msg},
                 {
                     "dicom_path": dicom_path,
                     "analysis_status": "failed",
-                    "error_details": str(e),
+                    "error_details": err_msg,
                 },
             )
 

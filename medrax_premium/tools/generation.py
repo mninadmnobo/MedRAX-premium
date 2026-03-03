@@ -1,9 +1,9 @@
-from typing import Dict, Optional, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type
 from pathlib import Path
 import uuid
 import tempfile
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from diffusers import StableDiffusionPipeline
 from langchain_core.callbacks import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
 from langchain_core.tools import BaseTool
@@ -37,6 +37,8 @@ class ChestXRayGeneratorInput(BaseModel):
 class ChestXRayGeneratorTool(BaseTool):
     """Tool for generating synthetic chest X-ray images using a fine-tuned Stable Diffusion model."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     name: str = "chest_xray_generator"
     description: str = (
         "Generates synthetic chest X-ray images from text descriptions of medical conditions. "
@@ -47,8 +49,8 @@ class ChestXRayGeneratorTool(BaseTool):
     )
     args_schema: Type[BaseModel] = ChestXRayGeneratorInput
 
-    model: StableDiffusionPipeline = None
-    device: torch.device = None
+    model: Any = None
+    device: Any = None
     temp_dir: Path = None
 
     def __init__(

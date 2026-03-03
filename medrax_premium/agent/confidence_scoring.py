@@ -1034,7 +1034,7 @@ class ConfidenceScoringPipeline:
             return self.extractors[task_type]
         
         # Fallback to VQA extractor (keyword analysis)
-        return VQAConfidenceExtractor(use_self_consistency=False)
+        return VQAConfidenceExtractor()
 
 
 class ConfidenceFusion:

@@ -1,5 +1,5 @@
-from typing import Dict, Optional, Tuple, Type
-from pydantic import BaseModel, Field
+from typing import Any, Dict, Optional, Tuple, Type
+from pydantic import BaseModel, ConfigDict, Field
 
 import skimage.io
 import torch
@@ -45,10 +45,12 @@ class ChestXRayClassifierTool(BaseTool):
         "Lung Opacity, Mass, Nodule, Pleural Thickening, Pneumonia, and Pneumothorax. "
         "Higher values indicate a higher likelihood of the condition being present."
     )
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     args_schema: Type[BaseModel] = ChestXRayInput
-    model: xrv.models.DenseNet = None
-    device: Optional[str] = "cuda"
-    transform: torchvision.transforms.Compose = None
+    model: Any = None
+    device: Any = None
+    transform: Any = None
 
     def __init__(self, model_name: str = "densenet121-res224-all", device: Optional[str] = "cuda"):
         super().__init__()
@@ -129,9 +131,12 @@ class ChestXRayClassifierTool(BaseTool):
             }
             return output, metadata
         except Exception as e:
-            return {"error": str(e)}, {
+            err_msg = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__}: {e!r}"
+            print(f"  ❌ Classifier error: {err_msg}")
+            return {"error": err_msg}, {
                 "image_path": image_path,
                 "analysis_status": "failed",
+                "error_details": err_msg,
             }
 
     async def _arun(

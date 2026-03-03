@@ -1,17 +1,19 @@
 import json
 import operator
+import time as _time
 from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime
 from typing import List, Dict, Any, TypedDict, Annotated, Optional, Tuple
 import copy
+import os
 
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage, AIMessage, HumanMessage
 from langchain_core.language_models import BaseLanguageModel
 from langchain_core.tools import BaseTool
 
-from .canonical_output import normalize_output, CanonicalFinding
+from .canonical_output import normalize_output, CanonicalFinding, extract_pathologies_with_polarity
 from .conflict_resolution import ConflictDetector, ConflictResolver, generate_conflict_report
 
 _ = load_dotenv()
@@ -117,6 +119,10 @@ class Agent:
         self.workflow = workflow.compile(checkpointer=checkpointer)
         self.tools = {t.name: t for t in tools}
         self.model = model.bind_tools(tools)
+        # Aggregated findings across turns keyed by image path.
+        # Used to run conflict detection/resolution across multiple tool runs
+        # that may occur in separate agent turns.
+        self.aggregated_findings = {}
 
     # ---- token-budget helpers ------------------------------------------------
     # GitHub Models free-tier GPT-4o has an 8 000 input-token hard cap.
@@ -227,6 +233,15 @@ class Agent:
                     )
                     total -= old_len - len(trimmed[i].content)
         
+        # Remove orphaned ToolMessages whose parent AIMessage was trimmed
+        valid_tc_ids = set()
+        for m in trimmed:
+            if hasattr(m, 'tool_calls') and m.tool_calls:
+                for tc in m.tool_calls:
+                    valid_tc_ids.add(tc.get('id', ''))
+        trimmed = [m for m in trimmed
+                   if not isinstance(m, ToolMessage) or m.tool_call_id in valid_tc_ids]
+        
         return trimmed
 
     def process_request(self, state: AgentState) -> Dict[str, List[AnyMessage]]:
@@ -291,48 +306,121 @@ class Agent:
 
     def execute_tools(self, state: AgentState) -> Dict[str, List[ToolMessage]]:
         """
-        Execute tool calls from the model's response with conflict detection and resolution.
-
-        Args:
-            state (AgentState): The current state of the agent.
-
-        Returns:
-            Dict[str, List[ToolMessage]]: A dictionary containing tool execution results.
+        Execute tool calls with error detection, cross-referencing, and conflict resolution.
         """
         tool_calls = state["messages"][-1].tool_calls
         results = []
         canonical_findings = []
         
-        # STEP 1: Execute all tools
-        print("\n" + "="*60)
-        print(f"🔧 Executing {len(tool_calls)} tool(s)")
+        print(f"\n{'='*60}")
+        print(f"🔧 Executing {len(tool_calls)} tool(s): {', '.join(c['name'] for c in tool_calls)}")
         print("="*60)
 
         for i, call in enumerate(tool_calls, 1):
-            print(f"\n[{i}/{len(tool_calls)}] Tool: {call['name']}")
+            t_start = _time.time()
+            print(f"\n[{i}/{len(tool_calls)}] 🛠️  {call['name']}")
+            _args_short = {k: (str(v)[:60] + '...' if len(str(v)) > 60 else v) for k, v in call.get('args', {}).items()}
+            print(f"  Args: {_args_short}")
             
             if call["name"] not in self.tools:
-                print("  ❌ Invalid tool")
+                print("  ❌ Invalid tool name")
                 result = "invalid tool, please retry"
             else:
                 try:
-                    result = self.tools[call["name"]].invoke(call["args"])
-                    print("  ✅ Execution successful")
+                    _invoke_args = self._resolve_image_paths(call.get("args", {}))
+                    raw_result = self.tools[call["name"]].invoke(_invoke_args)
+                    elapsed = _time.time() - t_start
                     
-                    # STEP 2: Normalize output to canonical format (if conflict resolution enabled)
-                    if self.enable_conflict_resolution:
+                    # Check if the tool returned an error dict
+                    _is_error = False
+                    if isinstance(raw_result, tuple) and len(raw_result) >= 1:
+                        first = raw_result[0]
+                        if isinstance(first, dict) and "error" in first:
+                            _is_error = True
+                            err_text = first['error'] or '(empty error)'
+                            print(f"  ⚠️  Tool returned error ({elapsed:.1f}s): {err_text[:200]}")
+                    
+                    if not _is_error:
+                        print(f"  ✅ Success ({elapsed:.1f}s)")
+                    
+                    # Normalize to canonical findings (skip errors)
+                    if self.enable_conflict_resolution and not _is_error:
                         tool_type = self._get_tool_type(call["name"])
                         normalized = normalize_output(
-                            result, 
-                            call["name"], 
-                            tool_type,
+                            raw_result, call["name"], tool_type,
                             **call.get("args", {})
                         )
                         canonical_findings.extend(normalized)
                         print(f"  📊 Normalized to {len(normalized)} finding(s)")
+
+                        # --- Aggregate findings across turns by image key ---
+                        try:
+                            args = call.get("args", {}) or {}
+                            image_key = None
+                            if isinstance(args, dict):
+                                if "image_path" in args:
+                                    image_key = args.get("image_path")
+                                elif "image_paths" in args:
+                                    ips = args.get("image_paths")
+                                    if isinstance(ips, (list, tuple)) and ips:
+                                        image_key = ips[0]
+                                    elif isinstance(ips, str):
+                                        image_key = ips
+                            # Fallback: try metadata from raw_result
+                            if not image_key and isinstance(raw_result, tuple) and len(raw_result) > 1 and isinstance(raw_result[1], dict):
+                                meta = raw_result[1]
+                                if "image_path" in meta:
+                                    image_key = meta.get("image_path")
+                                elif "image_paths" in meta:
+                                    mips = meta.get("image_paths")
+                                    if isinstance(mips, (list, tuple)) and mips:
+                                        image_key = mips[0]
+                            if image_key:
+                                ag = self.aggregated_findings.setdefault(image_key, [])
+                                # append non-duplicate findings
+                                for f in normalized:
+                                    dup_key = (f.pathology, f.source_tool, getattr(f, "raw_value", None))
+                                    if not any((ff.pathology, ff.source_tool, getattr(ff, "raw_value", None)) == dup_key for ff in ag):
+                                        ag.append(f)
+
+                                # Run conflict detection on aggregated set if multiple tools present
+                                unique_tools = set(f.source_tool for f in ag)
+                                if len(ag) > 1 and len(unique_tools) > 1:
+                                    agg_conflicts = self.conflict_detector.detect_conflicts(ag)
+                                    if agg_conflicts:
+                                        agg_resolutions = []
+                                        for conflict in agg_conflicts:
+                                            relevant_findings = [f for f in ag if f.pathology == conflict.finding]
+                                            res = self.conflict_resolver.resolve_conflict(conflict, relevant_findings)
+                                            agg_resolutions.append(res)
+
+                                        # Append aggregated conflict summary to latest tool result
+                                        if results:
+                                            results[-1].content += "\n\n--- AGGREGATED CONFLICT ANALYSIS ---\n"
+                                            n_def = sum(1 for r in agg_resolutions if r.get("should_defer", False))
+                                            lines = [f"⚠️ {len(agg_conflicts)} aggregated conflict(s) detected across tools ({len(unique_tools)} tools)."]
+                                            if n_def:
+                                                lines.append(f"{n_def} flagged for human review.")
+                                            for c, r in list(zip(agg_conflicts, agg_resolutions))[:3]:
+                                                lines.append(f"  • {c.finding}: {c.severity} — {r.get('decision','N/A')} ({r.get('confidence',0):.0%})")
+                                            results[-1].content += "\n".join(lines)
+
+                                        # Save comprehensive aggregated log
+                                        try:
+                                            self._save_tool_calls_with_conflicts(results, ag, agg_conflicts, agg_resolutions)
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            # Aggregation must never crash tool execution; log and continue
+                            import traceback as _tb
+                            _tb.print_exc()
+                    
+                    result = self._format_tool_result(raw_result, call["name"])
                 except Exception as e:
-                    print(f"  ❌ Error: {str(e)}")
-                    result = f"Error executing tool: {str(e)}"
+                    elapsed = _time.time() - t_start
+                    err_msg = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__}: {e!r}"
+                    print(f"  ❌ Error ({elapsed:.1f}s): {err_msg[:200]}")
+                    result = f"Error executing tool: {err_msg}"
 
             results.append(
                 ToolMessage(
@@ -343,30 +431,31 @@ class Agent:
                 )
             )
         
-        # STEP 3: Conflict Detection (if enabled and we have multiple findings)
+        # Cross-reference VQA ↔ classifier findings
+        if self.enable_conflict_resolution and canonical_findings:
+            self._cross_reference_findings(canonical_findings)
+        
+        # Conflict Detection (need findings from 2+ distinct tools)
         conflicts = []
         resolutions = []
+        unique_tools = set(f.source_tool for f in canonical_findings)
         
-        if self.enable_conflict_resolution and len(canonical_findings) > 1:
+        if self.enable_conflict_resolution and len(canonical_findings) > 1 and len(unique_tools) > 1:
             print(f"\n{'='*60}")
-            print("🔍 CONFLICT DETECTION")
+            print(f"🔍 CONFLICT DETECTION ({len(canonical_findings)} findings from {len(unique_tools)} tools)")
             print("="*60)
-            print(f"Analyzing {len(canonical_findings)} canonical findings...")
             
             conflicts = self.conflict_detector.detect_conflicts(canonical_findings)
             
             if conflicts:
                 print(f"\n⚠️  Detected {len(conflicts)} conflict(s)!")
-                
-                # STEP 4: Resolve conflicts
                 print("\n" + "="*60)
                 print("🔧 CONFLICT RESOLUTION")
                 print("="*60)
                 
-                for i, conflict in enumerate(conflicts, 1):
-                    print(f"\n[{i}/{len(conflicts)}] {conflict.to_summary()}")
+                for ci, conflict in enumerate(conflicts, 1):
+                    print(f"\n[{ci}/{len(conflicts)}] {conflict.to_summary()}")
                     
-                    # Get relevant findings for this conflict
                     relevant_findings = [
                         f for f in canonical_findings 
                         if f.pathology == conflict.finding
@@ -380,26 +469,22 @@ class Agent:
                     if resolution.get('should_defer', False):
                         print("  ⚠️  FLAGGED FOR HUMAN REVIEW")
                 
-                # Generate a COMPACT conflict summary for the tool message
-                # (Full report is saved to JSON log; keep message small to avoid 413 token errors)
-                n_deferred = sum(1 for r in resolutions if r.get('should_defer', False))
-                summary_lines = [f"⚠️ {len(conflicts)} conflict(s) detected, {len(resolutions)} resolved."]
-                if n_deferred:
-                    summary_lines.append(f"{n_deferred} flagged for human review.")
-                # Add top-3 most severe conflicts as one-liners
+                n_def = sum(1 for r in resolutions if r.get('should_defer', False))
+                lines = [f"⚠️ {len(conflicts)} conflict(s) detected, {len(resolutions)} resolved."]
+                if n_def:
+                    lines.append(f"{n_def} flagged for human review.")
                 for c, r in list(zip(conflicts, resolutions))[:3]:
-                    summary_lines.append(f"  • {c.finding}: {c.severity} — {r.get('decision','N/A')} ({r.get('confidence',0):.0%})")
+                    lines.append(f"  • {c.finding}: {c.severity} — {r.get('decision','N/A')} ({r.get('confidence',0):.0%})")
                 if len(conflicts) > 3:
-                    summary_lines.append(f"  … and {len(conflicts)-3} more (see logs)")
-                compact_report = "\n".join(summary_lines)
-                
+                    lines.append(f"  … and {len(conflicts)-3} more (see logs)")
                 if results:
-                    results[-1].content += f"\n\n--- CONFLICT ANALYSIS ---\n{compact_report}"
-                print(f"\n📋 Conflict summary appended to last tool result")
+                    results[-1].content += f"\n\n--- CONFLICT ANALYSIS ---\n" + "\n".join(lines)
             else:
                 print("✅ No conflicts detected - all tools agree")
+        elif self.enable_conflict_resolution and len(canonical_findings) > 0:
+            print(f"\n📊 {len(canonical_findings)} finding(s) from {len(unique_tools)} tool(s) — need 2+ for conflict detection")
         
-        # STEP 5: Save comprehensive logs
+        # Save comprehensive logs
         if self.enable_conflict_resolution:
             self._save_tool_calls_with_conflicts(results, canonical_findings, conflicts, resolutions)
         else:
@@ -408,10 +493,92 @@ class Agent:
         print(f"\n{'='*60}")  
         print("✅ Tool execution complete")
         print("="*60 + "\n")
-        print("Returning to model processing!")
 
         return {"messages": results}
     
+    @staticmethod
+    def _format_tool_result(result, tool_name):
+        """Convert raw tool output to compact, LLM-readable text."""
+        if isinstance(result, tuple) and len(result) >= 1:
+            first = result[0]
+            if isinstance(first, dict) and "error" in first:
+                return f"Error from {tool_name}: {first['error']}"
+        if isinstance(result, str):
+            return result[:800]
+        if isinstance(result, tuple) and len(result) == 2:
+            output, meta = result
+            if isinstance(output, dict) and not any(k in output for k in ("response", "image_path", "segmentation_image_path")):
+                numeric = {k: v for k, v in output.items() if isinstance(v, (int, float))}
+                if numeric:
+                    findings = {k: round(float(v), 3) for k, v in numeric.items() if float(v) > 0.05}
+                    if findings:
+                        lines = [f"  {k}: {v:.1%}" for k, v in sorted(findings.items(), key=lambda x: -x[1])]
+                        return f"Findings (>5%):\n" + "\n".join(lines) + f"\n({len(numeric)-len(findings)} below 5%)"
+                    return "No significant findings (all below 5%)."
+            if isinstance(output, dict) and "response" in output:
+                return f"Expert answer: {output['response']}"
+            if isinstance(output, str):
+                return output[:800]
+            if isinstance(output, dict) and "segmentation_image_path" in output:
+                metrics = output.get("metrics", {})
+                parts = ["Segmentation results:"]
+                for organ, m in list(metrics.items())[:6]:
+                    if isinstance(m, dict):
+                        parts.append(f"  {organ}: area={m.get('area_pixels','?')}px, conf={m.get('confidence_score','?'):.2f}")
+                if len(metrics) > 6:
+                    parts.append(f"  … and {len(metrics)-6} more organs")
+                return "\n".join(parts)
+            if isinstance(output, dict):
+                if "image_path" in output:
+                    return f"Output image: {output['image_path']}"
+                return str(output)[:600]
+        return str(result)[:600]
+
+    def _cross_reference_findings(self, canonical_findings):
+        """Align VQA text findings with classifier's pathology names for conflict detection."""
+        clf_pathologies = set()
+        vqa_info = {}
+        existing_vqa = set()
+
+        for f in canonical_findings:
+            if f.evidence_type == "classification":
+                clf_pathologies.add(f.pathology)
+            elif f.evidence_type == "vqa":
+                if f.pathology != "general_assessment":
+                    existing_vqa.add((f.source_tool, f.pathology))
+                raw = f.raw_value if isinstance(f.raw_value, str) else str(f.raw_value)
+                vqa_info[f.source_tool] = (raw, f.confidence)
+
+        if not clf_pathologies or not vqa_info:
+            return
+
+        new = []
+        for tool, (raw_text, base_conf) in vqa_info.items():
+            polarity = dict(extract_pathologies_with_polarity(raw_text))
+            for path in clf_pathologies:
+                if (tool, path) in existing_vqa:
+                    continue
+                if path in polarity:
+                    # VQA explicitly mentions this pathology (positive or negative)
+                    is_pos = polarity[path]
+                    conf = base_conf if is_pos else max(0.05, 1.0 - base_conf)
+                else:
+                    # VQA never mentioned this pathology — skip.
+                    # Creating a synthetic finding here would cause BERT NLI
+                    # to compare the raw VQA text (e.g. "Cavity") against
+                    # unrelated classifier pathologies (e.g. "Atelectasis"),
+                    # producing false-positive semantic conflicts.
+                    continue
+                new.append(CanonicalFinding(
+                    pathology=path, region="unspecified",
+                    confidence=conf, evidence_type="vqa",
+                    source_tool=tool, raw_value=raw_text[:300],
+                    metadata={"synthetic_cross_ref": True, "is_positive_mention": is_pos}
+                ))
+        canonical_findings.extend(new)
+        if new:
+            print(f"  🔗 Cross-referenced {len(new)} VQA findings to classifier pathologies")
+
     def _get_tool_type(self, tool_name: str) -> str:
         """Determine tool type from tool name."""
         if "classifier" in tool_name.lower() or "classification" in tool_name.lower():
@@ -426,7 +593,48 @@ class Agent:
             return "report"
         else:
             return "unknown"
-    
+
+    @staticmethod
+    def _resolve_image_paths(args):
+        """Resolve relative image paths using MEDRAX_FIGURES_DIR env var.
+
+        When the LLM passes a relative path like 'figures/11583/figure_1.jpg',
+        this resolves it to the absolute path under BENCH_ROOT so tools can
+        find the file on Kaggle or any deployment environment.
+        """
+        if not isinstance(args, dict):
+            return args
+        _fig_dir = os.environ.get("MEDRAX_FIGURES_DIR", "")
+        if not _fig_dir:
+            return args
+        args = dict(args)  # shallow copy — don't mutate LangChain objects
+        for key in ("image_path", "image_paths"):
+            if key not in args:
+                continue
+            val = args[key]
+            if isinstance(val, str) and val and not os.path.isabs(val) and not os.path.exists(val):
+                candidate = os.path.join(_fig_dir, val)
+                if os.path.exists(candidate):
+                    args[key] = candidate
+                    print(f"  \U0001f4c2 Resolved {key}: {val} \u2192 {candidate}")
+            elif isinstance(val, (list, tuple)):
+                new_vals = []
+                changed = False
+                for v in val:
+                    if isinstance(v, str) and v and not os.path.isabs(v) and not os.path.exists(v):
+                        c = os.path.join(_fig_dir, v)
+                        if os.path.exists(c):
+                            new_vals.append(c)
+                            changed = True
+                        else:
+                            new_vals.append(v)
+                    else:
+                        new_vals.append(v)
+                if changed:
+                    args[key] = new_vals
+                    print(f"  \U0001f4c2 Resolved {key} list ({len(new_vals)} items)")
+        return args
+
     def _save_tool_calls_with_conflicts(
         self, 
         tool_calls: List[ToolMessage], 

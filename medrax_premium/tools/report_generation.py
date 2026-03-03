@@ -1,5 +1,5 @@
 from typing import Any, Dict, Optional, Tuple, Type
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import torch
 
@@ -47,15 +47,19 @@ class ChestXRayReportGeneratorTool(BaseTool):
         "to a chest X-ray image file. Output is a structured report with both detailed "
         "observations and key clinical conclusions."
     )
-    device: Optional[str] = "cuda"
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    device: Any = None
     args_schema: Type[BaseModel] = ChestXRayInput
-    findings_model: VisionEncoderDecoderModel = None
-    impression_model: VisionEncoderDecoderModel = None
-    findings_tokenizer: BertTokenizer = None
-    impression_tokenizer: BertTokenizer = None
-    findings_processor: ViTImageProcessor = None
-    impression_processor: ViTImageProcessor = None
-    generation_args: Dict[str, Any] = None
+    findings_model: Any = None
+    impression_model: Any = None
+    findings_tokenizer: Any = None
+    impression_tokenizer: Any = None
+    findings_processor: Any = None
+    impression_processor: Any = None
+    generation_args: Optional[Dict[str, Any]] = None
+    num_consistency_samples: int = 0
+    consistency_temperature: float = 0.8
 
     def __init__(
         self,
@@ -63,6 +67,8 @@ class ChestXRayReportGeneratorTool(BaseTool):
         device: Optional[str] = "cuda",
         findings_model_path: str = "IAMJB/chexpert-mimic-cxr-findings-baseline",
         impression_model_path: str = "IAMJB/chexpert-mimic-cxr-impression-baseline",
+        num_consistency_samples: int = 0,
+        consistency_temperature: float = 0.8,
     ):
         """Initialize the ChestXRayReportGeneratorTool with both findings and impression models.
 
@@ -71,8 +77,12 @@ class ChestXRayReportGeneratorTool(BaseTool):
             device: Device to run models on.
             findings_model_path: HF repo ID or local path to the findings model.
             impression_model_path: HF repo ID or local path to the impression model.
+            num_consistency_samples: Number of self-consistency samples (0 = disabled).
+            consistency_temperature: Temperature for consistency sampling.
         """
         super().__init__()
+        self.num_consistency_samples = max(0, num_consistency_samples)
+        self.consistency_temperature = consistency_temperature
         self.device = torch.device(device) if device else "cuda"
 
         # Initialize findings model
@@ -106,7 +116,7 @@ class ChestXRayReportGeneratorTool(BaseTool):
             "num_return_sequences": 1,
             "max_length": 128,
             "use_cache": True,
-            "beam_width": 2,
+            "num_beams": 2,
         }
 
     def _process_image(
@@ -136,7 +146,9 @@ class ChestXRayReportGeneratorTool(BaseTool):
                 align_corners=False,
             )
 
-        pixel_values = pixel_values.to(self.device)
+        # Cast to model dtype (fp16) — processor returns fp32 by default
+        _dtype = next(model.parameters()).dtype
+        pixel_values = pixel_values.to(device=self.device, dtype=_dtype)
 
         return pixel_values
 
@@ -153,12 +165,16 @@ class ChestXRayReportGeneratorTool(BaseTool):
         Returns:
             str: Generated text for the report section.
         """
+        # VisionEncoderDecoderConfig stores token IDs on .decoder, not at
+        # the top level — fall back gracefully so either shape works.
+        _dcfg = getattr(model.config, "decoder", model.config)
         generation_config = GenerationConfig(
             **{
                 **self.generation_args,
-                "bos_token_id": model.config.bos_token_id,
-                "eos_token_id": model.config.eos_token_id,
-                "pad_token_id": model.config.pad_token_id,                "decoder_start_token_id": tokenizer.cls_token_id,
+                "bos_token_id": getattr(model.config, "bos_token_id", None) or getattr(_dcfg, "bos_token_id", None),
+                "eos_token_id": getattr(model.config, "eos_token_id", None) or getattr(_dcfg, "eos_token_id", None),
+                "pad_token_id": getattr(model.config, "pad_token_id", None) or getattr(_dcfg, "pad_token_id", None),
+                "decoder_start_token_id": tokenizer.cls_token_id,
             }
         )
 
@@ -181,12 +197,13 @@ class ChestXRayReportGeneratorTool(BaseTool):
         Returns:
             str: Generated text for the report section.
         """
+        _dcfg = getattr(model.config, "decoder", model.config)
         generation_config = GenerationConfig(
             **{
                 **self.generation_args,
-                "bos_token_id": model.config.bos_token_id,
-                "eos_token_id": model.config.eos_token_id,
-                "pad_token_id": model.config.pad_token_id,
+                "bos_token_id": getattr(model.config, "bos_token_id", None) or getattr(_dcfg, "bos_token_id", None),
+                "eos_token_id": getattr(model.config, "eos_token_id", None) or getattr(_dcfg, "eos_token_id", None),
+                "pad_token_id": getattr(model.config, "pad_token_id", None) or getattr(_dcfg, "pad_token_id", None),
                 "decoder_start_token_id": tokenizer.cls_token_id,
                 "do_sample": True,
                 "temperature": temperature,
@@ -321,34 +338,26 @@ class ChestXRayReportGeneratorTool(BaseTool):
                     impression_pixels, self.impression_model, self.impression_tokenizer
                 )
 
-            # Generate samples for self-consistency confidence
-            samples = self._generate_samples_for_confidence(
-                findings_pixels, impression_pixels, num_samples=5, temperature=0.8
-            )
-            
-            # Compute consistency scores
-            findings_confidence = self._compute_report_consistency(samples["findings_samples"])
-            impression_confidence = self._compute_report_consistency(samples["impression_samples"])
-            
-            # Overall confidence is weighted average
-            overall_confidence = (
-                0.6 * findings_confidence["consistency_score"] +
-                0.4 * impression_confidence["consistency_score"]
-            )
-
-            # Combine into formatted report
-            report = (
-                "CHEST X-RAY REPORT\n\n"
-                f"FINDINGS:\n{findings_text}\n\n"
-                f"IMPRESSION:\n{impression_text}"
-            )
-
+            # Generate samples for self-consistency confidence (if enabled)
             metadata = {
                 "image_path": image_path,
                 "analysis_status": "completed",
                 "sections_generated": ["findings", "impression"],
-                # Confidence-enabling data
-                "confidence_data": {
+            }
+
+            if self.num_consistency_samples > 0:
+                samples = self._generate_samples_for_confidence(
+                    findings_pixels, impression_pixels,
+                    num_samples=self.num_consistency_samples,
+                    temperature=self.consistency_temperature,
+                )
+                findings_confidence = self._compute_report_consistency(samples["findings_samples"])
+                impression_confidence = self._compute_report_consistency(samples["impression_samples"])
+                overall_confidence = (
+                    0.6 * findings_confidence["consistency_score"] +
+                    0.4 * impression_confidence["consistency_score"]
+                )
+                metadata["confidence_data"] = {
                     "overall_confidence": overall_confidence,
                     "findings": {
                         "consistency_score": findings_confidence["consistency_score"],
@@ -362,16 +371,24 @@ class ChestXRayReportGeneratorTool(BaseTool):
                         "avg_similarity": impression_confidence["avg_similarity"],
                         "samples": samples["impression_samples"],
                     },
-                },
-            }
+                }
+
+            # Combine into formatted report
+            report = (
+                "CHEST X-RAY REPORT\n\n"
+                f"FINDINGS:\n{findings_text}\n\n"
+                f"IMPRESSION:\n{impression_text}"
+            )
 
             return report, metadata
 
         except Exception as e:
-            return f"Error generating report: {str(e)}", {
+            err_msg = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__}: {e!r}"
+            print(f"  ❌ Report gen error: {err_msg}")
+            return {"error": err_msg}, {
                 "image_path": image_path,
                 "analysis_status": "failed",
-                "error": str(e),
+                "error_details": err_msg,
             }
 
     async def _arun(

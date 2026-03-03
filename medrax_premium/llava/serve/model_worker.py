@@ -15,16 +15,16 @@ import torch
 import uvicorn
 from functools import partial
 
-from medrax.llava.constants import WORKER_HEART_BEAT_INTERVAL
-from medrax.llava.utils import build_logger, server_error_msg, pretty_print_semaphore
-from medrax.llava.model.builder import load_pretrained_model
-from medrax.llava.mm_utils import (
+from medrax_premium.llava.constants import WORKER_HEART_BEAT_INTERVAL
+from medrax_premium.llava.utils import build_logger, server_error_msg, pretty_print_semaphore
+from medrax_premium.llava.model.builder import load_pretrained_model
+from medrax_premium.llava.mm_utils import (
     process_images,
     load_image_from_base64,
     tokenizer_image_token,
     KeywordsStoppingCriteria,
 )
-from medrax.llava.constants import (
+from medrax_premium.llava.constants import (
     IMAGE_TOKEN_INDEX,
     DEFAULT_IMAGE_TOKEN,
     DEFAULT_IM_START_TOKEN,
@@ -185,7 +185,7 @@ class ModelWorker:
         temperature = float(params.get("temperature", 1.0))
         top_p = float(params.get("top_p", 1.0))
         max_context_length = getattr(model.config, "max_position_embeddings", 2048)
-        max_new_tokens = min(int(params.get("max_new_tokens", 256)), 1024)
+        max_new_tokens = min(int(params.get("max_new_tokens", 512)), 1024)
         stop_str = params.get("stop", None)
         do_sample = True if temperature > 0.001 else False
 

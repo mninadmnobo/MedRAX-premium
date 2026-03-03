@@ -10,7 +10,9 @@ from .canonical_output import (
     normalize_grounding_output,
     normalize_report_output,
     normalize_generation_output,
-    get_confidence_pipeline
+    get_confidence_pipeline,
+    extract_pathologies_from_text,
+    extract_pathologies_with_polarity,
 )
 from .conflict_resolution import (
     Conflict,
@@ -70,7 +72,10 @@ __all__ = [
     "normalize_grounding_output",
     "normalize_report_output",
     "normalize_generation_output",
-    "get_confidence_pipeline",    # Conflict resolution
+    "get_confidence_pipeline",
+    "extract_pathologies_from_text",
+    "extract_pathologies_with_polarity",
+    # Conflict resolution
     "Conflict",
     "ConflictDetector",
     "ConflictResolver",

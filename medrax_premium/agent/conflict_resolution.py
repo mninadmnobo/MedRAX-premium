@@ -382,6 +382,15 @@ class ConflictDetector:
                 # Skip same-tool comparisons (e.g. classifier on image1 vs image2)
                 if finding1.source_tool == finding2.source_tool:
                     continue
+                # Skip synthetic cross-refs where VQA never mentioned the pathology.
+                # These have is_positive_mention=None and their raw_value is the
+                # original VQA text (e.g. "Cavity"), which would produce spurious
+                # BERT contradictions against unrelated classifier pathologies.
+                def _is_ungrounded_synthetic(f):
+                    m = f.metadata or {}
+                    return m.get("synthetic_cross_ref") and m.get("is_positive_mention") is None
+                if _is_ungrounded_synthetic(finding1) or _is_ungrounded_synthetic(finding2):
+                    continue
                 # Extract text from findings
                 text1 = self._extract_text_from_finding(finding1)
                 text2 = self._extract_text_from_finding(finding2)
@@ -829,6 +838,23 @@ class ConflictResolver:
                     f"Deferring to radiologist review."
                 ),
                 "should_defer": True,
+                "bert_analysis": bert_analysis,
+            }
+        
+        # Moderate gap (0.15–0.30): trust the higher-confidence tool but flag for review
+        if confidence_gap >= 0.15:
+            adjusted = highest.confidence * bert_analysis["severity_adjustment"]
+            return {
+                "decision": "trust_primary_tool",
+                "selected_tool": highest.source_tool,
+                "value": highest.confidence > 0.5,
+                "confidence": adjusted,
+                "reasoning": (
+                    f"BERT detected contradiction ({bert_analysis['contradiction_prob']:.0%}). "
+                    f"Moderate confidence gap — trusting {highest.source_tool} "
+                    f"({highest.confidence:.0%} vs {second.confidence:.0%})."
+                ),
+                "should_defer": adjusted < self.deferral_threshold,
                 "bert_analysis": bert_analysis,
             }
         

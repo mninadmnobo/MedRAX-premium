@@ -5,16 +5,16 @@ import json
 from tqdm import tqdm
 import shortuuid
 
-from medrax.llava.constants import (
+from medrax_premium.llava.constants import (
     IMAGE_TOKEN_INDEX,
     DEFAULT_IMAGE_TOKEN,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IM_END_TOKEN,
 )
-from medrax.llava.conversation import conv_templates, SeparatorStyle
-from medrax.llava.model.builder import load_pretrained_model
-from medrax.llava.utils import disable_torch_init
-from medrax.llava.mm_utils import (
+from medrax_premium.llava.conversation import conv_templates, SeparatorStyle
+from medrax_premium.llava.model.builder import load_pretrained_model
+from medrax_premium.llava.utils import disable_torch_init
+from medrax_premium.llava.mm_utils import (
     tokenizer_image_token,
     get_model_name_from_path,
     KeywordsStoppingCriteria,

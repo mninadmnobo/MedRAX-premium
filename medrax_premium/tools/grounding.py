@@ -5,7 +5,7 @@ import tempfile
 import matplotlib.pyplot as plt
 import torch
 from PIL import Image
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from transformers import AutoModelForCausalLM, AutoProcessor, BitsAndBytesConfig
 from langchain_core.callbacks import (
@@ -26,7 +26,7 @@ class XRayPhraseGroundingInput(BaseModel):
         ...,
         description="Medical finding or condition to locate in the image (e.g., 'Pleural effusion')",
     )
-    max_new_tokens: int = Field(default=300, description="Maximum number of new tokens to generate")
+    max_new_tokens: int = Field(default=256, description="Maximum number of new tokens to generate")
 
 
 class XRayPhraseGroundingTool(BaseTool):
@@ -48,9 +48,11 @@ class XRayPhraseGroundingTool(BaseTool):
     )
     args_schema: Type[BaseModel] = XRayPhraseGroundingInput
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     model: Any = None
     processor: Any = None
-    device: str = "cuda"
+    device: Any = None
     temp_dir: Path = None
 
     def __init__(
@@ -63,8 +65,18 @@ class XRayPhraseGroundingTool(BaseTool):
         device: Optional[str] = "cuda",
     ):
         """Initialize the XRay Phrase Grounding Tool."""
+        import gc
         super().__init__()
         self.device = torch.device(device) if device else "cuda"
+
+        # -- Pre-flight: GPU free-space guard --------------------------------
+        quantized = load_in_4bit or load_in_8bit
+        from medrax_premium.tools.xray_vqa import _check_gpu_free_space, _parse_gpu_id
+        _check_gpu_free_space(
+            str(self.device),
+            required_gb=4.0 if quantized else 9.0,
+            label="MAIRA-2 Grounding",
+        )
 
         # Setup quantization config
         if load_in_4bit:
@@ -81,14 +93,54 @@ class XRayPhraseGroundingTool(BaseTool):
         else:
             quantization_config = None
 
+        # Fix: MAIRA-2 has no `lm_head` attribute, which crashes
+        # bitsandbytes quantization (get_keys_to_not_convert → get_output_embeddings
+        # → self.lm_head → AttributeError). Patch before loading.
+        _bnb_int = None
+        _orig_get_keys = None
+        if quantization_config is not None:
+            import transformers.integrations.bitsandbytes as _bnb_int
+            if hasattr(_bnb_int, "get_keys_to_not_convert"):
+                _orig_get_keys = _bnb_int.get_keys_to_not_convert
+                def _safe_get_keys(model):
+                    try:
+                        return _orig_get_keys(model)
+                    except AttributeError:
+                        return []
+                _bnb_int.get_keys_to_not_convert = _safe_get_keys
+
+        # -- Device-map: pin quantised model to *target* GPU only -----------
+        device_kw: Dict = {}
+        if quantization_config is not None:
+            gpu_id = _parse_gpu_id(str(self.device))
+            max_mem: Dict = {}
+            for i in range(torch.cuda.device_count()):
+                if i == gpu_id:
+                    tot = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                    max_mem[i] = f"{int(tot) - 1}GiB"
+                else:
+                    max_mem[i] = "0GiB"
+            max_mem["cpu"] = "24GiB"
+            device_kw["device_map"] = "auto"
+            device_kw["max_memory"] = max_mem
+        else:
+            device_kw["device_map"] = {"": str(self.device)}
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Load model
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            device_map="auto" if quantization_config else str(self.device),
             cache_dir=cache_dir,
             trust_remote_code=True,
             quantization_config=quantization_config,
+            **device_kw,
         )
+
+        # Restore original function after loading
+        if _bnb_int is not None and _orig_get_keys is not None:
+            _bnb_int.get_keys_to_not_convert = _orig_get_keys
         self.processor = AutoProcessor.from_pretrained(
             model_path, cache_dir=cache_dir, trust_remote_code=True
         )

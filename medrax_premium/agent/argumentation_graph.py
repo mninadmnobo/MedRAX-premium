@@ -181,8 +181,8 @@ class ArgumentGraphBuilder:
         """
         Detect circular logic patterns.
         
-        Simplified implementation: if we have both strong support and strong attack,
-        it might indicate contradictory interpretations (cycle-like).
+        Circular arguments require 3+ tools where A→B→C→A creates a loop.
+        With only 2 tools, a simple disagreement is a contradiction, NOT circular logic.
         
         Args:
             support_nodes: Nodes supporting the claim
@@ -191,16 +191,21 @@ class ArgumentGraphBuilder:
         Returns:
             True if cycles detected, False otherwise
         """
-        # Simple heuristic: if both sides have similar strength and both are present,
-        # it's somewhat contradictory (circular-ish)
         if not support_nodes or not attack_nodes:
+            return False
+        
+        # True cycles require at least 3 tools forming a loop.
+        # A 2-tool disagreement is an ordinary contradiction — not circular.
+        total_nodes = len(support_nodes) + len(attack_nodes)
+        if total_nodes < 3:
             return False
         
         support_strength = sum(n.strength for n in support_nodes)
         attack_strength = sum(n.strength for n in attack_nodes)
         
-        # If both sides are equally strong, it's contradictory/circular
-        if abs(support_strength - attack_strength) < 0.3:
+        # With 3+ tools: if both sides are nearly equal AND multiple tools
+        # appear on each side, it may indicate contradictory referencing.
+        if abs(support_strength - attack_strength) < 0.15:
             return True
         
         return False

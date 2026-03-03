@@ -7,9 +7,9 @@ import time
 import gradio as gr
 import requests
 
-from medrax.llava.conversation import default_conversation, conv_templates, SeparatorStyle
-from medrax.llava.constants import LOGDIR
-from medrax.llava.utils import build_logger, server_error_msg, violates_moderation, moderation_msg
+from medrax_premium.llava.conversation import default_conversation, conv_templates, SeparatorStyle
+from medrax_premium.llava.constants import LOGDIR
+from medrax_premium.llava.utils import build_logger, server_error_msg, violates_moderation, moderation_msg
 import hashlib
 
 

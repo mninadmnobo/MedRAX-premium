@@ -13,7 +13,7 @@ import skimage.measure
 import skimage.transform
 import traceback
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from langchain_core.callbacks import (
     AsyncCallbackManagerForToolRun,
     CallbackManagerForToolRun,
@@ -75,12 +75,14 @@ class ChestXRaySegmentationTool(BaseTool):
     )
     args_schema: Type[BaseModel] = ChestXRaySegmentationInput
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     model: Any = None
-    device: Optional[str] = "cuda"
+    device: Any = None
     transform: Any = None
     pixel_spacing_mm: float = 0.2
     temp_dir: Path = Path("temp")
-    organ_map: Dict[str, int] = None
+    organ_map: Optional[Dict[str, int]] = None
 
     def __init__(self, device: Optional[str] = "cuda", temp_dir: Optional[Path] = Path("temp")):
         """Initialize the segmentation tool with model and temporary directory."""
@@ -307,10 +309,13 @@ class ChestXRaySegmentationTool(BaseTool):
             return output, metadata
 
         except Exception as e:
-            error_output = {"error": str(e)}
+            err_msg = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__}: {e!r}"
+            print(f"  ❌ Segmentation error: {err_msg}")
+            error_output = {"error": err_msg}
             error_metadata = {
                 "image_path": image_path,
                 "analysis_status": "failed",
+                "error_details": err_msg,
                 "error_traceback": traceback.format_exc(),
             }
             return error_output, error_metadata

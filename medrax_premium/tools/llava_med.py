@@ -1,5 +1,5 @@
 from typing import Any, Dict, Optional, Tuple, Type
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import torch
 
@@ -34,11 +34,11 @@ def _lazy_load_llava():
     if _llava_imports_loaded:
         return
     
-    from medrax.llava.conversation import conv_templates as _conv_templates
-    from medrax.llava.model.builder import load_pretrained_model as _load_pretrained_model
-    from medrax.llava.mm_utils import tokenizer_image_token as _tokenizer_image_token
-    from medrax.llava.mm_utils import process_images as _process_images
-    from medrax.llava.constants import (
+    from medrax_premium.llava.conversation import conv_templates as _conv_templates
+    from medrax_premium.llava.model.builder import load_pretrained_model as _load_pretrained_model
+    from medrax_premium.llava.mm_utils import tokenizer_image_token as _tokenizer_image_token
+    from medrax_premium.llava.mm_utils import process_images as _process_images
+    from medrax_premium.llava.constants import (
         IMAGE_TOKEN_INDEX as _IMAGE_TOKEN_INDEX,
         DEFAULT_IMAGE_TOKEN as _DEFAULT_IMAGE_TOKEN,
         DEFAULT_IM_START_TOKEN as _DEFAULT_IM_START_TOKEN,
@@ -80,11 +80,16 @@ class LlavaMedTool(BaseTool):
         "While it can process chest X-rays, it may not be as reliable for detailed chest X-ray analysis. "
         "Input should be a question and optionally a path to a medical image file."
     )
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     args_schema: Type[BaseModel] = LlavaMedInput
     tokenizer: Any = None
     model: Any = None
     image_processor: Any = None
     context_len: int = 200000
+    device: Any = None
+    num_consistency_samples: int = 0
+    consistency_temperature: float = 0.7
 
     def __init__(
         self,
@@ -95,9 +100,14 @@ class LlavaMedTool(BaseTool):
         device: str = "cuda",
         load_in_4bit: bool = False,
         load_in_8bit: bool = False,
+        num_consistency_samples: int = 0,
+        consistency_temperature: float = 0.7,
         **kwargs,
     ):
         super().__init__()
+        self.device = device
+        self.num_consistency_samples = max(0, num_consistency_samples)
+        self.consistency_temperature = consistency_temperature
         _lazy_load_llava()  # Load LLaVA dependencies on first use
         self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
             model_path=model_path,
@@ -135,14 +145,13 @@ class LlavaMedTool(BaseTool):
         input_ids = (
             tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
             .unsqueeze(0)
-            .cuda()
         )
 
         image_tensor = None
         if image_path:
             image = Image.open(image_path)
             image_tensor = process_images([image], self.image_processor, self.model.config)[0]
-            image_tensor = image_tensor.unsqueeze(0).half().cuda()
+            image_tensor = image_tensor.unsqueeze(0).half()
 
         return input_ids, image_tensor
 
@@ -165,7 +174,7 @@ class LlavaMedTool(BaseTool):
                 images=image_tensor,
                 do_sample=do_sample,
                 temperature=temperature,
-                max_new_tokens=500,
+                max_new_tokens=512,
                 use_cache=True,
             )
         return self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
@@ -248,38 +257,44 @@ class LlavaMedTool(BaseTool):
         try:
             input_ids, image_tensor = self._process_input(question, image_path)
             input_ids = input_ids.to(device=self.model.device)
-            image_tensor = image_tensor.to(device=self.model.device, dtype=self.model.dtype)
+            if image_tensor is not None:
+                image_tensor = image_tensor.to(device=self.model.device, dtype=self.model.dtype)
 
             # Generate primary response (deterministic)
             output = self._generate_single_response(input_ids, image_tensor, do_sample=False)
-            
-            # Generate multiple samples for self-consistency confidence
-            samples = self._generate_samples_for_confidence(
-                input_ids, image_tensor, num_samples=5, temperature=0.7
-            )
-            
-            # Compute self-consistency confidence score
-            confidence_data = self._compute_self_consistency_score(samples)
 
+            # Build metadata
             metadata = {
                 "question": question,
                 "image_path": image_path,
                 "analysis_status": "completed",
-                # Confidence-enabling data for self-consistency scoring
-                "confidence_data": {
+            }
+
+            # Optional self-consistency confidence scoring
+            if self.num_consistency_samples > 0:
+                samples = self._generate_samples_for_confidence(
+                    input_ids, image_tensor,
+                    num_samples=self.num_consistency_samples,
+                    temperature=self.consistency_temperature,
+                )
+                confidence_data = self._compute_self_consistency_score(samples)
+                metadata["confidence_data"] = {
                     "samples": samples,
                     "consistency_score": confidence_data["consistency_score"],
                     "num_unique_answers": confidence_data["num_unique_answers"],
                     "answer_distribution": confidence_data["answer_distribution"],
                     "consensus_answer": confidence_data["consensus_answer"],
-                },
-            }
+                }
+
             return output, metadata
         except Exception as e:
-            return f"Error generating answer: {str(e)}", {
+            err_msg = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__}: {e!r}"
+            print(f"  ❌ LLaVA-Med error: {err_msg}")
+            return {"error": err_msg}, {
                 "question": question,
                 "image_path": image_path,
                 "analysis_status": "failed",
+                "error_details": err_msg,
             }
 
     async def _arun(

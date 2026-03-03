@@ -16,8 +16,8 @@ import numpy as np
 import requests
 import uvicorn
 
-from medrax.llava.constants import CONTROLLER_HEART_BEAT_EXPIRATION
-from medrax.llava.utils import build_logger, server_error_msg
+from medrax_premium.llava.constants import CONTROLLER_HEART_BEAT_EXPIRATION
+from medrax_premium.llava.utils import build_logger, server_error_msg
 
 
 logger = build_logger("controller", "controller.log")

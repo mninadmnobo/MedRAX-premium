@@ -22,7 +22,7 @@ import torch
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_projector.builder import build_vision_projector
 
-from medrax.llava.constants import (
+from medrax_premium.llava.constants import (
     IGNORE_INDEX,
     IMAGE_TOKEN_INDEX,
     DEFAULT_IMAGE_PATCH_TOKEN,

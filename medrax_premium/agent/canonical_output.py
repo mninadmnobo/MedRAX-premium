@@ -205,48 +205,27 @@ def normalize_classification_output(
     findings = []
     pipeline = get_confidence_pipeline()
     
-    print("  🔍 DEBUG: normalize_classification_output called")
-    print(f"     Input type: {type(output)}")
-    print(f"     Input value (first 200 chars): {str(output)[:200]}")
-    
     # Extract the actual output dict (handle tuple format)
     if isinstance(output, tuple):
-        print(f"     Detected tuple with {len(output)} elements")
         output_dict = output[0] if output and len(output) > 0 else {}
         metadata = output[1] if len(output) > 1 else {}
     elif isinstance(output, dict):
-        print(f"     Detected dict with {len(output)} keys")
         output_dict = output
         metadata = {}
     else:
-        # Can't parse this format
-        print(f"  ⚠️ Warning: Unexpected classification output format: {type(output)}")
         return findings
     
-    # Validate output_dict is actually a dict
     if not isinstance(output_dict, dict):
-        print(f"  ⚠️ Warning: Expected dict, got {type(output_dict)}")
         return findings
-    
-    print(f"     Output dict has {len(output_dict)} entries")
-    
-    filtered_count = 0
-    created_count = 0
     
     for pathology, prob in output_dict.items():
-        # Skip non-numeric entries (accept both Python and numpy numeric types)
         try:
-            prob_float = float(prob)  # Convert to Python float (works for numpy types too)
+            prob_float = float(prob)
         except (TypeError, ValueError):
-            print(f"     ⏭️ Skipping {pathology}: non-numeric value {type(prob)}")
             continue
         
-        # Only include findings with meaningful probability
         if prob_float < min_confidence_threshold:
-            filtered_count += 1
             continue
-        
-        print(f"     ✅ Processing {pathology}: {prob_float:.4f}")
         
         # Build auxiliary data for confidence scoring
         auxiliary_data = {"logits": None}
@@ -265,19 +244,14 @@ def normalize_classification_output(
             confidence_result = pipeline.process(model_output, target_pathology=pathology)
             calibrated_conf = confidence_result.calibrated_confidence
             uncertainty = confidence_result.uncertainty
-            
-            print(f"        Raw: {prob_float:.4f} -> Calibrated: {calibrated_conf:.4f}")
-            print(f"        Uncertainty: {uncertainty:.4f} | Method: {confidence_result.method}")
-            
         except Exception as e:
-            print(f"        ❌ Pipeline calibration failed: {e}, using legacy calibration")
             calibrated_conf = calibrate_confidence(tool_name, prob_float)
             uncertainty = 1.0 - calibrated_conf
         
         try:
             finding = CanonicalFinding(
                 pathology=pathology,
-                region="global",  # Classification is global, not localized
+                region="global",
                 confidence=calibrated_conf,
                 evidence_type="classification",
                 source_tool=tool_name,
@@ -291,13 +265,8 @@ def normalize_classification_output(
                 }
             )
             findings.append(finding)
-            created_count += 1
-            print(f"        ✅ Created finding #{created_count}")
-        except Exception as e:
-            print(f"        ❌ Failed to create CanonicalFinding: {e}")
-    
-    print(f"     Filtered out {filtered_count} findings below {min_confidence_threshold*100:.0f}% threshold")
-    print(f"     ✅ Created {len(findings)} canonical findings")
+        except Exception:
+            pass
     
     return findings
 
@@ -313,6 +282,8 @@ def normalize_vqa_output(
     
     Uses the ConfidenceScoringPipeline for self-consistency confidence extraction.
     Now reads confidence_data from tool metadata for pre-computed scores.
+    Expanded to handle negation ("no cardiomegaly" → low confidence) and to
+    always return at least one finding so conflict detection can function.
     
     Args:
         output: Raw text output from VQA model (can be dict, tuple, or string)
@@ -323,6 +294,40 @@ def normalize_vqa_output(
     Returns:
         List of CanonicalFinding objects with calibrated confidence scores
     """
+    try:
+        return _normalize_vqa_output_inner(output, tool_name, prompt, samples)
+    except Exception as exc:
+        # Absolute safety net — NEVER return [] for VQA; always give
+        # conflict detection something to work with.
+        text = ""
+        if isinstance(output, tuple) and output:
+            first = output[0]
+            if isinstance(first, dict):
+                text = first.get("response", first.get("error", str(first)))
+            else:
+                text = str(first)
+        elif isinstance(output, dict):
+            text = output.get("response", output.get("error", str(output)))
+        else:
+            text = str(output)
+        return [CanonicalFinding(
+            pathology="general_assessment",
+            region="unspecified",
+            confidence=0.5,
+            evidence_type="vqa",
+            source_tool=tool_name,
+            raw_value=text[:500],
+            metadata={"prompt": prompt, "fallback": True, "error": str(exc)}
+        )]
+
+
+def _normalize_vqa_output_inner(
+    output: Any,
+    tool_name: str,
+    prompt: str = "",
+    samples: Optional[List[str]] = None
+) -> List[CanonicalFinding]:
+    """Core VQA normalization (called by the public wrapper)."""
     pipeline = get_confidence_pipeline()
     
     # Handle tuple format (response_dict, metadata)
@@ -336,9 +341,18 @@ def normalize_vqa_output(
                 auxiliary_data["confidence_data"] = metadata_dict["confidence_data"]
         output = output[0] if output and len(output) > 0 else {}
     
-    # Handle dict with error
+    # Handle dict with error — still produce a low-confidence finding so that
+    # conflict detection sees *something* from this tool
     if isinstance(output, dict) and "error" in output:
-        return []
+        return [CanonicalFinding(
+            pathology="general_assessment",
+            region="unspecified",
+            confidence=0.1,
+            evidence_type="vqa",
+            source_tool=tool_name,
+            raw_value=output.get("error", ""),
+            metadata={"prompt": prompt, "tool_error": True}
+        )]
     
     # Extract text
     if isinstance(output, dict):
@@ -365,30 +379,39 @@ def normalize_vqa_output(
         confidence_method = confidence_result.method
         
     except Exception as e:
-        print(f"  ⚠️ Pipeline confidence scoring failed: {e}, using legacy method")
         raw_confidence = estimate_text_confidence(text)
         calibrated_conf = calibrate_confidence(tool_name, raw_confidence)
         uncertainty = 1.0 - calibrated_conf
         confidence_method = "keyword_analysis_legacy"
     
-    # Simple pathology extraction (can be improved with NER)
-    pathologies = extract_pathologies_from_text(text)
+    # ── Polarity-aware pathology extraction ──
+    # Uses expanded synonym lists and checks for preceding negation phrases
+    # so "no cardiomegaly" → (Cardiomegaly, False) → low confidence.
+    polarity_results = extract_pathologies_with_polarity(text)
     
     findings = []
-    if pathologies:
-        for pathology in pathologies:
+    if polarity_results:
+        for pathology, is_positive in polarity_results:
+            # Adjust per-pathology confidence based on polarity
+            if is_positive:
+                path_conf = calibrated_conf
+            else:
+                # Negative mention → flip confidence to reflect *absence*
+                path_conf = max(0.05, 1.0 - calibrated_conf) if calibrated_conf > 0.5 else 0.1
+            
             finding = CanonicalFinding(
                 pathology=pathology,
-                region="unspecified",  # Region extraction can be improved
-                confidence=calibrated_conf,
+                region="unspecified",
+                confidence=path_conf,
                 evidence_type="vqa",
                 source_tool=tool_name,
                 raw_value=text,
                 metadata={
                     "prompt": prompt,
-                    "full_response": text,
+                    "full_response": text[:500],
                     "confidence_estimation_method": confidence_method,
                     "uncertainty": uncertainty,
+                    "is_positive_mention": is_positive,
                     "self_consistency_samples": len(auxiliary_data.get("confidence_data", {}).get("samples", [])) or len(auxiliary_data.get("samples", []))
                 }
             )
@@ -404,7 +427,7 @@ def normalize_vqa_output(
             raw_value=text,
             metadata={
                 "prompt": prompt,
-                "full_response": text,
+                "full_response": text[:500],
                 "confidence_estimation_method": confidence_method,
                 "uncertainty": uncertainty
             }
@@ -483,7 +506,6 @@ def normalize_segmentation_output(
                 confidence_method = confidence_result.method
                 
             except Exception as e:
-                print(f"  ⚠️ Pipeline confidence scoring failed for {region}: {e}")
                 calibrated_conf = calibrate_confidence(tool_name, raw_confidence)
                 uncertainty = 1.0 - calibrated_conf
                 confidence_method = "legacy"
@@ -509,34 +531,123 @@ def normalize_segmentation_output(
     return findings
 
 
+# Negation window — number of characters before a pathology mention to scan for negation
+_NEGATION_WINDOW = 40
+_NEGATION_PHRASES = [
+    "no ", "no evidence", "not seen", "absent", "without ", "negative for",
+    "ruled out", "unremarkable", "unlikely", "not identified", "not detected",
+    "no significant", "no definite", "not consistent", "no obvious",
+    "denies ", "no acute",
+]
+
+# Expanded synonyms / aliases keyed by the canonical DenseNet-121 label
+_PATHOLOGY_ALIASES: Dict[str, List[str]] = {
+    "Atelectasis":       ["atelectasis", "atelectatic", "volume loss",
+                          "collapsed lobe", "subsegmental collapse"],
+    "Cardiomegaly":      ["cardiomegaly", "cardiac enlargement", "enlarged heart",
+                          "enlarged cardiac silhouette", "heart is enlarged",
+                          "cardiac silhouette is enlarged", "heart enlargement",
+                          "heart size is enlarged"],
+    "Consolidation":     ["consolidation", "consolidated", "airspace disease",
+                          "air-space disease", "airspace opacity",
+                          "lobar consolidation"],
+    "Edema":             ["edema", "oedema", "pulmonary edema",
+                          "fluid overload", "vascular congestion",
+                          "interstitial edema", "alveolar edema",
+                          "pulmonary congestion"],
+    "Effusion":          ["effusion", "pleural effusion", "pleural fluid",
+                          "fluid in the pleural", "costophrenic blunting",
+                          "blunted costophrenic", "meniscus sign"],
+    "Emphysema":         ["emphysema", "hyperinflation", "hyperinflated",
+                          "copd", "over-inflation", "barrel chest",
+                          "flattened diaphragm"],
+    "Fibrosis":          ["fibrosis", "fibrotic", "scarring", "pulmonary fibrosis",
+                          "interstitial fibrosis", "reticular pattern"],
+    "Fracture":          ["fracture", "fractured", "broken rib", "rib fracture",
+                          "cortical disruption"],
+    "Hernia":            ["hernia", "hiatal hernia", "diaphragmatic hernia",
+                          "hiatus hernia"],
+    "Infiltration":      ["infiltration", "infiltrate", "infiltrates",
+                          "opacity", "opacities", "opacification",
+                          "hazy opacity", "ground-glass", "ground glass",
+                          "lung opacity"],
+    "Mass":              ["mass", "masses", "tumor", "tumour", "neoplasm",
+                          "lung mass", "mediastinal mass"],
+    "Nodule":            ["nodule", "nodular", "nodules",
+                          "pulmonary nodule", "lung nodule",
+                          "solitary pulmonary nodule"],
+    "Pleural Thickening":["pleural thickening", "thickened pleura",
+                          "pleural thickened", "pleural calcification"],
+    "Pneumonia":         ["pneumonia", "pneumonic", "infectious process",
+                          "infection", "lobar pneumonia",
+                          "bronchopneumonia"],
+    "Pneumothorax":      ["pneumothorax", "tension pneumothorax",
+                          "air in pleural", "collapsed lung",
+                          "air leak", "visceral pleural line"],
+    "Support Devices":   ["support device", "support devices", "pacemaker",
+                          "catheter", "central line", "picc line",
+                          "endotracheal tube", "ett", "chest tube",
+                          "nasogastric tube", "ng tube", "tracheostomy",
+                          "line placement", "port-a-cath",
+                          "swan-ganz", "icd", "defibrillator"],
+    "No Finding":        ["no finding", "no findings", "normal study",
+                          "unremarkable", "no acute",
+                          "no significant abnormality", "clear lungs",
+                          "lungs are clear", "normal chest",
+                          "within normal limits"],
+}
+
+
+def _is_negated(text_lower: str, match_start: int) -> bool:
+    """Return True if the match at *match_start* is preceded by a negation phrase."""
+    window = text_lower[max(0, match_start - _NEGATION_WINDOW): match_start]
+    return any(neg in window for neg in _NEGATION_PHRASES)
+
+
 def extract_pathologies_from_text(text: str) -> List[str]:
     """
-    Extract pathology mentions from text using keyword matching.
-    
-    TODO: Replace with proper Named Entity Recognition (NER) model.
-    
+    Extract pathology mentions from text using keyword matching with
+    expanded synonyms and aliases.
+
     Args:
         text: Natural language text
-        
+
     Returns:
-        List of detected pathologies
+        List of detected pathologies (canonical DenseNet-121 names)
     """
-    # Standard pathology list
-    PATHOLOGIES = [
-        "Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Effusion",
-        "Emphysema", "Fibrosis", "Fracture", "Hernia", "Infiltration",
-        "Mass", "Nodule", "Pleural Thickening", "Pneumonia", "Pneumothorax",
-        "Support Devices", "No Finding"
-    ]
-    
     text_lower = text.lower()
-    found = []
-    
-    for pathology in PATHOLOGIES:
-        if pathology.lower() in text_lower:
-            found.append(pathology)
-    
+    found: List[str] = []
+
+    for pathology, aliases in _PATHOLOGY_ALIASES.items():
+        for alias in aliases:
+            idx = text_lower.find(alias)
+            if idx != -1:
+                if pathology not in found:
+                    found.append(pathology)
+                break  # one alias match is enough per pathology
+
     return found
+
+
+def extract_pathologies_with_polarity(text: str) -> List[tuple]:
+    """
+    Extract pathologies together with polarity (positive / negative mention).
+
+    Returns:
+        List of (pathology_name, is_positive) tuples.
+    """
+    text_lower = text.lower()
+    results: List[tuple] = []
+
+    for pathology, aliases in _PATHOLOGY_ALIASES.items():
+        for alias in aliases:
+            idx = text_lower.find(alias)
+            if idx != -1:
+                positive = not _is_negated(text_lower, idx)
+                results.append((pathology, positive))
+                break
+
+    return results
 
 
 def normalize_output(output: Any, tool_name: str, tool_type: str, **kwargs) -> List[CanonicalFinding]:
