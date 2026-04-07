@@ -14,7 +14,7 @@ Example:
 
 import json
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
@@ -150,7 +150,7 @@ class ToolTrustManager:
     
     def weighted_vote(
         self,
-        tools_and_confidences: list[Tuple[str, float]]
+        tools_and_confidences: List[Tuple[str, float]]
     ) -> float:
         """
         Combine tool outputs weighted by trust.

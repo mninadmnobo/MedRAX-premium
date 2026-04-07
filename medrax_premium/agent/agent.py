@@ -124,6 +124,10 @@ class Agent:
         # that may occur in separate agent turns.
         self.aggregated_findings = {}
 
+    def reset_for_new_question(self):
+        """Reset per-question state. Call before each new benchmark question."""
+        self.aggregated_findings = {}
+
     # ---- token-budget helpers ------------------------------------------------
     # GitHub Models free-tier GPT-4o has an 8 000 input-token hard cap.
     # Tool schemas (~6-9 tools) consume ~2 000-2 500 tokens invisibly.
@@ -260,32 +264,10 @@ class Agent:
             response = self.model.invoke(messages)
         except Exception as e:
             if "413" in str(e) or "tokens_limit_reached" in str(e):
-                # Emergency trim: strip ALL images, keep only last 6 messages
-                print("⚠️  413 token limit hit — emergency trim and retry")
-                emergency = []
-                for m in messages:
-                    if isinstance(m, SystemMessage):
-                        emergency.append(m)
-                    elif isinstance(m, HumanMessage):
-                        emergency.append(self._strip_images_from_human(m))
-                    elif isinstance(m, ToolMessage):
-                        emergency.append(ToolMessage(
-                            tool_call_id=m.tool_call_id,
-                            name=m.name,
-                            content=self._truncate_content(str(m.content), 150),
-                        ))
-                    elif isinstance(m, AIMessage):
-                        new_m = copy.copy(m)
-                        if isinstance(m.content, str):
-                            new_m.content = self._truncate_content(m.content, 300)
-                        emergency.append(new_m)
-                    else:
-                        emergency.append(m)
-                # Keep system + last 6
-                sys_msgs = [m for m in emergency if isinstance(m, SystemMessage)]
-                rest = [m for m in emergency if not isinstance(m, SystemMessage)]
-                messages = sys_msgs + rest[-6:]
-                response = self.model.invoke(messages)
+                # Return graceful skip instead of destructive emergency retry
+                # (stripping images makes the model answer blind → wrong answers)
+                print("⚠️  413 token limit hit — skipping (context too large)")
+                return {"messages": [AIMessage(content="[TOKEN_LIMIT_EXCEEDED] Unable to process — context too large for the model's input window.")]}
             else:
                 raise
         
@@ -391,6 +373,9 @@ class Agent:
                                         agg_resolutions = []
                                         for conflict in agg_conflicts:
                                             relevant_findings = [f for f in ag if f.pathology == conflict.finding]
+                                            # Fallback for GACL / non-standard conflicts
+                                            if not relevant_findings and conflict.tools_involved:
+                                                relevant_findings = [f for f in ag if f.source_tool in conflict.tools_involved]
                                             res = self.conflict_resolver.resolve_conflict(conflict, relevant_findings)
                                             agg_resolutions.append(res)
 
@@ -456,10 +441,17 @@ class Agent:
                 for ci, conflict in enumerate(conflicts, 1):
                     print(f"\n[{ci}/{len(conflicts)}] {conflict.to_summary()}")
                     
+                    # Primary filter: exact pathology match
                     relevant_findings = [
                         f for f in canonical_findings 
                         if f.pathology == conflict.finding
                     ]
+                    # Fallback for GACL / non-standard conflicts: use tools_involved
+                    if not relevant_findings and conflict.tools_involved:
+                        relevant_findings = [
+                            f for f in canonical_findings
+                            if f.source_tool in conflict.tools_involved
+                        ]
                     
                     resolution = self.conflict_resolver.resolve_conflict(conflict, relevant_findings)
                     resolutions.append(resolution)
@@ -563,11 +555,12 @@ class Agent:
                     is_pos = polarity[path]
                     conf = base_conf if is_pos else max(0.05, 1.0 - base_conf)
                 else:
-                    # VQA never mentioned this pathology — skip.
-                    # Creating a synthetic finding here would cause BERT NLI
-                    # to compare the raw VQA text (e.g. "Cavity") against
-                    # unrelated classifier pathologies (e.g. "Atelectasis"),
-                    # producing false-positive semantic conflicts.
+                    # VQA never mentioned this pathology.
+                    # Silence is NOT informative: CheXagent returns terse
+                    # single-finding answers, so absence-of-mention does NOT
+                    # mean the pathology is absent.  Creating a synthetic
+                    # "absent at 20%" finding here leads to false CRITICAL
+                    # conflicts with every classifier pathology at 60-71%.
                     continue
                 new.append(CanonicalFinding(
                     pathology=path, region="unspecified",

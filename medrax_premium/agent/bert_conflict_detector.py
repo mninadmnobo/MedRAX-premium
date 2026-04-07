@@ -521,6 +521,9 @@ class MedicalConflictDetector(BERTConflictDetector):
                 conflict_type="contradiction" if has_conflict else bert_result.conflict_type,
                 explanation=explanation,
                 text_pair=(text1, text2),
+                entailment_prob=bert_result.entailment_prob,
+                neutral_prob=bert_result.neutral_prob,
+                raw_logits=bert_result.raw_logits,
             )
         
         return bert_result

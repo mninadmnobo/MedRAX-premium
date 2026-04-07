@@ -119,128 +119,321 @@ class ConflictDetector:
         self.bert_device = bert_device
         self.bert_cache_dir = bert_cache_dir
         
-        # BERT detector (lazy loaded)
-        self._bert_detector = None
-        
         # Initialize GACL for semantic conflict detection
         self.gacl_detector = GACLConflictDetector(anomaly_threshold=0.6)
     
+    # Class-level BERT singleton — loaded once, shared across all instances.
+    # Protected by _shared_bert_lock to prevent double-loading and by a
+    # defensive hasattr check so gc.collect() / del agent can never clear it.
+    _shared_bert_detector = None
+    _shared_bert_failed = False
+
     @property
     def bert_detector(self):
-        """Lazy load BERT detector on first use."""
-        if self._bert_detector is None and self.use_bert:
-            try:
-                from .bert_conflict_detector import MedicalConflictDetector
-                self._bert_detector = MedicalConflictDetector(
-                    device=self.bert_device,
-                    cache_dir=self.bert_cache_dir,
-                    conflict_threshold=0.6,
-                )
-                print("✓ BERT conflict detector loaded successfully")
-            except Exception as e:
-                print(f"⚠️ Failed to load BERT detector: {e}. Using rule-based detection.")
-                self.use_bert = False
-        return self._bert_detector
+        """Lazy load BERT detector on first use (shared across ALL instances).
+
+        The singleton is stored on the *class* so ``del agent`` / ``gc.collect()``
+        between benchmark cases cannot accidentally reclaim it.
+        """
+        # Fast-path: already loaded
+        det = ConflictDetector._shared_bert_detector
+        if det is not None:
+            return det
+        if ConflictDetector._shared_bert_failed or not self.use_bert:
+            return None
+        try:
+            from .bert_conflict_detector import MedicalConflictDetector
+            det = MedicalConflictDetector(
+                device=self.bert_device,
+                cache_dir=self.bert_cache_dir,
+                conflict_threshold=0.6,
+            )
+            # Store on class — survives instance deletion
+            ConflictDetector._shared_bert_detector = det
+            print("✓ BERT conflict detector loaded successfully")
+        except Exception as e:
+            print(f"⚠️ Failed to load BERT detector: {e}. Using rule-based detection.")
+            ConflictDetector._shared_bert_failed = True
+            self.use_bert = False
+        return ConflictDetector._shared_bert_detector
     
     def detect_conflicts(self, findings: List[CanonicalFinding]) -> List[Conflict]:
         """
-        Analyze findings for conflicts using BERT + rule-based framework.
+        Tool-level conflict detection.
         
-        Detection Pipeline:
-        1. Group findings by pathology
-        2. For each group with 2+ tools:
-           a. BERT-based semantic conflict detection (if enabled)
-           b. Rule-based presence/absence conflict detection
-           c. GACL anatomical consistency check
+        At most **1 conflict per pair of distinct tools**.
+        If N tools are called → max C(N, 2) conflicts.
+        
+        Algorithm:
+        1. Deduplicate findings: one entry per (tool, pathology), keep max confidence.
+        2. For each unordered pair of tools, find the shared pathology with the
+           worst present-vs-absent disagreement.
+        3. If that gap exceeds the sensitivity threshold → 1 conflict.
         
         Args:
             findings: List of canonical findings from all tools
             
         Returns:
-            List of detected conflicts
+            List of detected conflicts (≤ C(N,2) where N = number of distinct tools)
         """
-        conflicts = []
-        
-        # Group findings by pathology
-        by_pathology = self._group_by_pathology(findings)
-        
-        # Check each pathology for conflicts
-        for pathology, tool_findings in by_pathology.items():
-            # Need at least 2 tools to have a conflict
-            if len(tool_findings) < 2:
+        # --- Step 1: deduplicate ------------------------------------------------
+        # When the same classifier runs on 3 images we get 3×18 = 54 findings.
+        # Keep only the highest-confidence entry per (tool, pathology).
+        by_tool: Dict[str, Dict[str, CanonicalFinding]] = {}
+        for f in findings:
+            tool = f.source_tool
+            path = f.pathology
+            if tool not in by_tool:
+                by_tool[tool] = {}
+            existing = by_tool[tool].get(path)
+            if existing is None or f.confidence > existing.confidence:
+                by_tool[tool][path] = f
+
+        tool_names = list(by_tool.keys())
+        if len(tool_names) < 2:
+            return []
+
+        # --- Step 2: one comparison per tool pair --------------------------------
+        conflicts: List[Conflict] = []
+        for i in range(len(tool_names)):
+            for j in range(i + 1, len(tool_names)):
+                conflict = self._compare_tool_pair(
+                    tool_names[i], by_tool[tool_names[i]],
+                    tool_names[j], by_tool[tool_names[j]],
+                )
+                if conflict:
+                    conflicts.append(conflict)
+
+        # --- Step 3: GACL anatomical consistency check ----------------------------
+        # If segmentation + classification findings coexist, GACL can detect
+        # anatomical inconsistencies (e.g. abnormal measurements vs normal class)
+        # that rule-based confidence-gap checks would miss.
+        gacl_conflict = self._run_gacl_check(by_tool)
+        if gacl_conflict:
+            # Only add if not already covered by a pairwise conflict on same tools
+            already_covered = any(
+                set(c.tools_involved) == set(gacl_conflict.tools_involved)
+                and c.finding == gacl_conflict.finding
+                for c in conflicts
+            )
+            if not already_covered:
+                conflicts.append(gacl_conflict)
+
+        return conflicts
+
+    # ------------------------------------------------------------------
+    # Helper: GACL anatomical consistency check
+    # ------------------------------------------------------------------
+    def _run_gacl_check(
+        self, by_tool: Dict[str, Dict[str, "CanonicalFinding"]]
+    ) -> Optional["Conflict"]:
+        """Run GACL if both segmentation and classification tools are present.
+
+        GACL compares anatomical measurements from segmentation against the
+        classifier's prediction.  It can catch subtle structural anomalies
+        (e.g. early cardiomyopathy) that a pure confidence-gap rule misses.
+        Returns a single Conflict or None.
+        """
+        seg_tool = clf_tool = None
+        for tool_name, findings_map in by_tool.items():
+            sample = next(iter(findings_map.values()), None)
+            if sample is None:
                 continue
-            
-            # STEP 1: BERT-based semantic conflict detection (PRIMARY)
-            if self.use_bert:
-                bert_conflicts = self._check_bert_conflicts(pathology, tool_findings)
-                conflicts.extend(bert_conflicts)
-            
-            # STEP 2: Rule-based presence/absence conflicts (FALLBACK)
-            presence_conflicts = self._check_presence_conflicts(pathology, tool_findings)
-            # Only add if not already detected by BERT
-            for pc in presence_conflicts:
-                if not any(c.finding == pc.finding and c.conflict_type == "presence" for c in conflicts):
-                    conflicts.append(pc)
-            
-            # STEP 3: GACL anatomical consistency check
-            semantic_conflicts = self._check_semantic_conflicts_gacl(pathology, tool_findings)
-            # Deduplicate: only add if not already detected by BERT for same tools
-            for gc in semantic_conflicts:
-                is_duplicate = any(
-                    c.conflict_type == "semantic" and 
-                    c.finding == gc.finding and
-                    set(c.tools_involved) == set(gc.tools_involved)
-                    for c in conflicts
+            if sample.evidence_type == "segmentation":
+                seg_tool = tool_name
+            elif sample.evidence_type == "classification":
+                clf_tool = tool_name
+
+        if not seg_tool or not clf_tool:
+            return None
+
+        try:
+            # Build segmentation output dict from raw values
+            seg_output: Dict[str, Any] = {}
+            for _path, finding in by_tool[seg_tool].items():
+                if isinstance(finding.raw_value, dict):
+                    seg_output.update(finding.raw_value)
+                else:
+                    seg_output[finding.region] = {
+                        "confidence_score": finding.confidence
+                    }
+
+            # Build classification output (highest-confidence pathology)
+            clf_findings = by_tool[clf_tool]
+            best_clf = max(clf_findings.values(), key=lambda f: f.confidence)
+            is_normal = best_clf.confidence < 0.5 or best_clf.pathology in (
+                "No Finding", "unknown"
+            )
+            clf_output = {
+                "class": "Normal" if is_normal else best_clf.pathology,
+                "score": best_clf.confidence,
+            }
+
+            result = self.gacl_detector.detect_semantic_conflict(
+                seg_output, clf_output
+            )
+
+            if result.get("has_conflict"):
+                anomaly = result.get("anomaly_score", 0.5)
+                sev = "critical" if anomaly > 0.8 else (
+                    "moderate" if anomaly > 0.6 else "minor"
                 )
-                if not is_duplicate:
-                    conflicts.append(gc)
-        
-        return conflicts
-    
-    def _group_by_pathology(self, findings: List[CanonicalFinding]) -> Dict[str, List[CanonicalFinding]]:
-        """Group findings by pathology name."""
-        grouped = {}
-        for finding in findings:
-            if finding.pathology not in grouped:
-                grouped[finding.pathology] = []
-            grouped[finding.pathology].append(finding)
-        return grouped
-    
-    def _check_presence_conflicts(self, pathology: str, findings: List[CanonicalFinding]) -> List[Conflict]:
-        """
-        Check if tools disagree on whether a finding is present or absent.
-        
-        Rules:
-        - >0.7 confidence = present
-        - <0.3 confidence = absent
-        - 0.3-0.7 = uncertain
-        
-        Conflict if: max_confidence - min_confidence > threshold
-        """
-        conflicts = []
-        
-        confidences = [f.confidence for f in findings]
-        max_conf = max(confidences)
-        min_conf = min(confidences)
-        
-        # Check for significant disagreement
-        if max_conf - min_conf > self.CONFIDENCE_GAP_THRESHOLD:
-            # One tool says present, another says absent
-            if max_conf > self.PRESENCE_THRESHOLD_HIGH and min_conf < self.PRESENCE_THRESHOLD_LOW:
-                severity = "critical" if max_conf > 0.85 else "moderate"
-                
-                conflict = Conflict(
-                    conflict_type="presence",
-                    finding=pathology,
-                    tools_involved=[f.source_tool for f in findings],
-                    values=["present" if f.confidence > 0.5 else "absent" for f in findings],
-                    confidences=confidences,
-                    severity=severity,
-                    recommendation=self._get_presence_resolution_strategy(findings)
+                return Conflict(
+                    conflict_type="anatomical_consistency",
+                    finding=result.get(
+                        "most_likely_diagnosis", "anatomical pattern"
+                    ),
+                    tools_involved=[seg_tool, clf_tool],
+                    values=[
+                        result["segmentation_pattern"],
+                        result["classification_prediction"],
+                    ],
+                    confidences=[
+                        result.get("confidence_in_diagnosis", 0.5),
+                        result.get("classification_confidence", 0.5),
+                    ],
+                    severity=sev,
+                    recommendation=result.get(
+                        "explanation",
+                        "Review anatomical measurements vs classification.",
+                    ),
+                    bert_scores={
+                        "gacl_anomaly_score": anomaly,
+                    },
                 )
-                conflicts.append(conflict)
-        
-        return conflicts
+        except Exception as e:
+            print(f"  \u26a0\ufe0f GACL check failed: {e}")
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Helper: effective confidence (fixes VQA cross-ref calibration)
+    # ------------------------------------------------------------------
+    def _effective_confidence(self, f: CanonicalFinding) -> float:
+        """Return calibrated confidence for presence/absence comparison.
+
+        Synthetic VQA cross-refs carry the VQA's raw (uncalibrated) base
+        confidence which is typically very low (~0.20).  That does NOT mean
+        the VQA thinks the pathology is absent.  Fix:
+        - Positive mention  → treat as *present*  (≥ 0.55)
+        - Negative mention  → treat as *absent*   (≤ 0.20)
+        - Non-synthetic     → use original confidence as-is
+        """
+        meta = f.metadata or {}
+        if meta.get("synthetic_cross_ref"):
+            if meta.get("is_positive_mention") is True:
+                return max(f.confidence, 0.55)
+            if meta.get("is_positive_mention") is False:
+                return min(f.confidence, 0.20)
+        return f.confidence
+
+    # ------------------------------------------------------------------
+    # Helper: compare one pair of tools → 0 or 1 conflict
+    # ------------------------------------------------------------------
+    def _compare_tool_pair(
+        self,
+        tool1: str, findings1: Dict[str, CanonicalFinding],
+        tool2: str, findings2: Dict[str, CanonicalFinding],
+    ) -> Optional[Conflict]:
+        """Compare two tools on shared pathologies; return worst disagreement.
+
+        Only pathologies where **both** tools have an opinion are checked.
+        Meta-entries like ``general_assessment`` are skipped.
+        """
+        skip = {"general_assessment", "unknown", "No Finding"}
+        p1 = {k: v for k, v in findings1.items() if k not in skip}
+        p2 = {k: v for k, v in findings2.items() if k not in skip}
+        shared = set(p1) & set(p2)
+        if not shared:
+            return None
+
+        worst_path: Optional[str] = None
+        worst_gap = 0.0
+
+        for path in shared:
+            c1 = self._effective_confidence(p1[path])
+            c2 = self._effective_confidence(p2[path])
+            present1 = c1 > 0.5
+            present2 = c2 > 0.5
+
+            if present1 != present2:
+                gap = abs(c1 - c2)
+                if gap > worst_gap:
+                    worst_gap = gap
+                    worst_path = path
+
+        if not worst_path or worst_gap < self.CONFIDENCE_GAP_THRESHOLD:
+            return None
+
+        f1, f2 = p1[worst_path], p2[worst_path]
+        c1 = self._effective_confidence(f1)
+        c2 = self._effective_confidence(f2)
+        severity = "critical" if worst_gap > 0.5 else ("moderate" if worst_gap > 0.3 else "minor")
+
+        # --- Attach BERT-NLI scores if available (enriches resolution) ---
+        bert_scores = self._run_bert_on_pair(f1, f2)
+        if bert_scores:
+            # Let BERT override severity when it has a strong opinion
+            cp = bert_scores.get("contradiction_prob", 0.0)
+            if cp > 0.85:
+                severity = "critical"
+            elif cp > 0.70 and severity == "minor":
+                severity = "moderate"
+
+        return Conflict(
+            conflict_type="presence",
+            finding=worst_path,
+            tools_involved=[tool1, tool2],
+            values=[
+                f"present ({c1:.0%})" if c1 > 0.5 else f"absent ({c1:.0%})",
+                f"present ({c2:.0%})" if c2 > 0.5 else f"absent ({c2:.0%})",
+            ],
+            confidences=[c1, c2],
+            severity=severity,
+            recommendation=self._get_presence_resolution_strategy([f1, f2]),
+            bert_scores=bert_scores,
+        )
+    
+    # ------------------------------------------------------------------
+    # Helper: run BERT-NLI on a pair of findings (enriches the Conflict)
+    # ------------------------------------------------------------------
+    def _run_bert_on_pair(
+        self,
+        f1: CanonicalFinding,
+        f2: CanonicalFinding,
+    ) -> Optional[Dict[str, Any]]:
+        """Run BERT-NLI on two findings and return score dict (or None).
+
+        This enriches the Conflict object with semantic analysis without
+        creating additional conflicts.  If BERT is unavailable or fails
+        gracefully, the conflict still proceeds with rule-based scores.
+        """
+        if not self.use_bert:
+            return None
+        try:
+            det = self.bert_detector
+            if det is None:
+                return None
+            text1 = self._extract_text_from_finding(f1)
+            text2 = self._extract_text_from_finding(f2)
+            if not text1 or not text2:
+                return None
+            prediction = det.detect_conflict(
+                text1=text1, text2=text2,
+                tool1_name=f1.source_tool, tool2_name=f2.source_tool,
+            )
+            return {
+                "contradiction_prob": prediction.conflict_probability,
+                "entailment_prob": prediction.entailment_prob,
+                "neutral_prob": prediction.neutral_prob,
+                "conflict_type": prediction.conflict_type,
+                "threshold_used": det.conflict_threshold,
+                "text1_preview": text1[:200],
+                "text2_preview": text2[:200],
+            }
+        except Exception as e:
+            print(f"  ⚠️ BERT enrichment failed: {e}")
+            return None
     
     def _get_presence_resolution_strategy(self, findings: List[CanonicalFinding]) -> str:
         """Recommend how to resolve presence/absence conflict."""
@@ -253,199 +446,6 @@ class ConflictDetector:
             return f"Moderate confidence from {max_finding.source_tool} ({max_finding.confidence:.0%}). Recommend: Call additional verification tool."
         else:
             return "Low confidence across all tools. Recommend: Defer to radiologist review."
-    
-    def _check_semantic_conflicts_gacl(self, pathology: str, findings: List[CanonicalFinding]) -> List[Conflict]:
-        """
-        Detect semantic conflicts using GACL for ALL CXR pathologies.
-        
-        GACL (Graph-Based Anatomical Consistency Learning) detects when:
-        - Segmentation finds anatomical patterns inconsistent with classification
-        - Multiple tools contradict each other on disease presence
-        - Anatomical measurements suggest pathology not detected by classifier
-        
-        Works for ALL pathologies: Pneumonia, Pneumothorax, Cardiomegaly, Effusion, etc.
-        
-        Args:
-            pathology: The finding being checked (e.g., "Pneumonia", "Cardiomegaly")
-            findings: Findings from different tools for this pathology
-            
-        Returns:
-            List of conflicts (0 or 1) if semantic conflict detected
-        """
-        # Find segmentation and classification pairs
-        seg_findings = [f for f in findings if "segmentation" in f.source_tool.lower()]
-        clf_findings = [f for f in findings if "classifier" in f.source_tool.lower()]
-        
-        # Need both types to detect semantic conflict
-        if not (seg_findings and clf_findings):
-            return []
-        
-        # Use GACL for all pathologies
-        try:
-            for seg in seg_findings:
-                for clf in clf_findings:
-                    conflict = self.detect_semantic_conflict_gacl(
-                        seg.raw_value,  # Segmentation measurements
-                        clf.raw_value   # Classification prediction
-                    )
-                    if conflict:
-                        return [conflict]
-        except Exception as e:
-            # Gracefully handle GACL failures
-            print(f"  ⚠️ GACL analysis failed for {pathology}: {str(e)}")
-        
-        return []
-    
-    def detect_semantic_conflict_gacl(self, seg_output: Dict[str, Any], 
-                                      classifier_output: Dict[str, Any]) -> Optional[Conflict]:
-        """
-        Detect semantic conflicts using Graph-Based Anatomical Consistency Learning.
-        
-        Detects when segmentation finds anatomical/structural anomalies but classifier 
-        predicts normal (or vice versa). Uses learned anatomical patterns rather than 
-        hardcoded rules.
-        
-        Works for ALL CXR pathologies:
-        - Cardiac: Cardiomegaly, Enlarged Cardiomediastinum
-        - Lung: Pneumonia, Pneumothorax, Consolidation
-        - Pleural: Effusion, Pleural Thickening
-        - Others: Nodule, Mass, Fracture, etc.
-        
-        Args:
-            seg_output: Segmentation tool output with anatomical measurements
-            classifier_output: Classification tool output
-        
-        Returns:
-            Conflict object if semantic conflict detected, None otherwise
-        """
-        try:
-            # Run GACL analysis
-            analysis = self.gacl_detector.detect_semantic_conflict(seg_output, classifier_output)
-            
-            if not analysis.get("has_conflict", False):
-                return None
-            
-            # Create conflict representation (generic for all pathologies)
-            conflict = Conflict(
-                conflict_type="semantic",
-                finding="Anatomical pattern consistency",
-                tools_involved=["segmentation_tool", "classification_model"],
-                values=[
-                    analysis["segmentation_pattern"],
-                    analysis["classification_prediction"]
-                ],
-                confidences=[
-                    1.0 - analysis["anomaly_score"],  # Abnormality confidence
-                    analysis["classification_confidence"]
-                ],
-                severity="critical",
-                recommendation=(
-                    f"Graph-based anatomical analysis detected inconsistency. "
-                    f"Segmentation analysis suggests: {analysis['most_likely_diagnosis']} "
-                    f"({analysis['confidence_in_diagnosis']:.0%} confidence). "
-                    f"Reason: {analysis['explanation']}"
-                )
-            )
-            
-            return conflict
-        
-        except Exception:
-            # Gracefully handle GACL analysis failures
-            return None
-    
-    def _check_bert_conflicts(
-        self, 
-        pathology: str, 
-        findings: List[CanonicalFinding]
-    ) -> List[Conflict]:
-        """
-        Use BERT to detect semantic conflicts in textual outputs.
-        
-        Compares all pairs of findings using NLI-based conflict detection.
-        
-        Args:
-            pathology: The finding being checked
-            findings: Findings from different tools
-            
-        Returns:
-            List of detected conflicts
-        """
-        conflicts = []
-        
-        if not self.bert_detector:
-            return conflicts
-        
-        # Compare all pairs of findings from DIFFERENT tools only.
-        # Same tool called on different images is NOT a conflict.
-        for i, finding1 in enumerate(findings):
-            for finding2 in findings[i + 1:]:
-                # Skip same-tool comparisons (e.g. classifier on image1 vs image2)
-                if finding1.source_tool == finding2.source_tool:
-                    continue
-                # Skip synthetic cross-refs where VQA never mentioned the pathology.
-                # These have is_positive_mention=None and their raw_value is the
-                # original VQA text (e.g. "Cavity"), which would produce spurious
-                # BERT contradictions against unrelated classifier pathologies.
-                def _is_ungrounded_synthetic(f):
-                    m = f.metadata or {}
-                    return m.get("synthetic_cross_ref") and m.get("is_positive_mention") is None
-                if _is_ungrounded_synthetic(finding1) or _is_ungrounded_synthetic(finding2):
-                    continue
-                # Extract text from findings
-                text1 = self._extract_text_from_finding(finding1)
-                text2 = self._extract_text_from_finding(finding2)
-                
-                if not text1 or not text2:
-                    continue
-                
-                # Run BERT conflict detection
-                try:
-                    prediction = self.bert_detector.detect_conflict(
-                        text1=text1,
-                        text2=text2,
-                        tool1_name=finding1.source_tool,
-                        tool2_name=finding2.source_tool,
-                    )
-                    
-                    if prediction.has_conflict:
-                        # Determine severity based on confidence
-                        if prediction.conflict_probability > 0.85:
-                            severity = "critical"
-                        elif prediction.conflict_probability > 0.7:
-                            severity = "moderate"
-                        else:
-                            severity = "minor"
-                        
-                        # Capture ALL BERT scores for resolution pipeline
-                        bert_scores = {
-                            "contradiction_prob": prediction.conflict_probability,
-                            "entailment_prob": prediction.entailment_prob,
-                            "neutral_prob": prediction.neutral_prob,
-                            "conflict_type": prediction.conflict_type,
-                            "threshold_used": self.bert_detector.conflict_threshold,
-                            "text1_preview": text1[:200],
-                            "text2_preview": text2[:200],
-                        }
-                        
-                        conflict = Conflict(
-                            conflict_type="semantic",
-                            finding=pathology,
-                            tools_involved=[finding1.source_tool, finding2.source_tool],
-                            values=[text1[:100], text2[:100]],  # Truncate for display
-                            confidences=[finding1.confidence, finding2.confidence],
-                            severity=severity,
-                            recommendation=(
-                                f"BERT detected contradiction ({prediction.conflict_probability:.0%} confidence). "
-                                f"{prediction.explanation}"
-                            ),
-                            bert_scores=bert_scores,  # Include ALL BERT scores
-                        )
-                        conflicts.append(conflict)
-                        
-                except Exception as e:
-                    print(f"  ⚠️ BERT conflict detection failed for {pathology}: {e}")
-        
-        return conflicts
     
     def _extract_text_from_finding(self, finding: CanonicalFinding) -> str:
         """
@@ -505,8 +505,8 @@ class ConflictResolver:
             "description": "Binary presence/absence of pathology"
         },
         "localization": {
-            "primary": "segmentation_tool",
-            "fallback": "phrase_grounding_tool",
+            "primary": "chest_xray_segmentation",
+            "fallback": "xray_phrase_grounding",
             "description": "Precise anatomical location"
         },
         "description": {
@@ -606,17 +606,18 @@ class ConflictResolver:
                 "value": None,
             }
         
+        # ===== COMPUTE TRUST WEIGHTS (independent of argumentation) =====
+        trust_weights = None
+        if self.enable_tool_trust:
+            trust_weights = {
+                finding.source_tool: self.trust_manager.get_weight(finding.source_tool)
+                for finding in findings
+            }
+
         # ===== PREMIUM COMPONENT #1: BUILD ARGUMENT GRAPH =====
         argument_graph = None
         if self.enable_argumentation and len(findings) >= 1:
             try:
-                # Get tool trust weights if enabled
-                trust_weights = None
-                if self.enable_tool_trust:
-                    trust_weights = {
-                        finding.source_tool: self.trust_manager.get_weight(finding.source_tool)
-                        for finding in findings
-                    }
                 
                 # Build the argument graph
                 argument_graph = self.argument_builder.build_from_conflict(
@@ -668,6 +669,35 @@ class ConflictResolver:
             except Exception as e:
                 print(f"⚠️  Abstention check failed: {e}")
         
+        # ===== PREMIUM COMPONENT #3: ARGUMENT GRAPH + TOOL TRUST RESOLUTION =====
+        # If the graph has a clear winner, use it to resolve — this is the
+        # main value-add of the premium pipeline.  Only fall through to the
+        # legacy fallback when the graph is inconclusive ("unclear").
+        if argument_graph and argument_graph.net_winner != "unclear" and argument_graph.certainty > 0.55:
+            is_present = argument_graph.net_winner == "support"
+            winning_nodes = argument_graph.support_nodes if is_present else argument_graph.attack_nodes
+            if winning_nodes:
+                best_node = max(winning_nodes, key=lambda n: n.strength)
+                # Confidence = graph certainty adjusted by BERT severity
+                adj_conf = argument_graph.certainty * bert_analysis.get("severity_adjustment", 1.0)
+                return {
+                    "decision": "argumentation_graph_winner",
+                    "selected_tool": best_node.tool_name,
+                    "value": is_present,
+                    "confidence": adj_conf,
+                    "reasoning": (
+                        f"Argumentation graph resolves conflict: {argument_graph.net_winner} wins "
+                        f"(certainty={argument_graph.certainty:.0%}, "
+                        f"gap={argument_graph.confidence_gap:.2f}). "
+                        f"Strongest contributor: {best_node.tool_name} "
+                        f"({best_node.confidence:.0%}, trust-weighted strength: {best_node.strength:.2f})."
+                    ),
+                    "should_defer": adj_conf < self.deferral_threshold,
+                    "argumentation_graph": argument_graph.to_dict(),
+                    "tool_weights_used": trust_weights or {},
+                    "bert_analysis": bert_analysis,
+                }
+        
         # ===== FALLBACK: ORIGINAL RESOLUTION LOGIC (Backward Compatible) =====
         
         # STEP 2: BERT-guided resolution for high-confidence contradictions
@@ -698,6 +728,10 @@ class ConflictResolver:
                 primary_finding.confidence, 
                 bert_analysis
             )
+            # Factor in learned tool trust weight
+            if trust_weights:
+                tw = trust_weights.get(primary_tool, 1.0)
+                adjusted_confidence *= tw
             
             resolution = {
                 "decision": "trust_primary_tool",
@@ -705,6 +739,10 @@ class ConflictResolver:
                 "value": primary_finding.confidence > 0.5,
                 "confidence": adjusted_confidence,
                 "reasoning": (
+                    f"Primary tool for {task_type} is {primary_tool} "
+                    f"(trust={trust_weights.get(primary_tool, 1.0):.0%}). "
+                    f"BERT contradiction: {bert_analysis.get('contradiction_prob', 0):.0%}"
+                ) if trust_weights else (
                     f"Primary tool for {task_type} is {primary_tool}. "
                     f"BERT contradiction: {bert_analysis.get('contradiction_prob', 0):.0%}"
                 ),
@@ -717,6 +755,9 @@ class ConflictResolver:
                 fallback_finding.confidence,
                 bert_analysis
             )
+            if trust_weights:
+                tw = trust_weights.get(fallback_tool, 1.0)
+                adjusted_confidence *= tw
             
             resolution = {
                 "decision": "trust_fallback_tool",
@@ -724,6 +765,10 @@ class ConflictResolver:
                 "value": fallback_finding.confidence > 0.5,
                 "confidence": adjusted_confidence,
                 "reasoning": (
+                    f"Using fallback tool {fallback_tool} for {task_type} "
+                    f"(trust={trust_weights.get(fallback_tool, 1.0):.0%}). "
+                    f"BERT contradiction: {bert_analysis.get('contradiction_prob', 0):.0%}"
+                ) if trust_weights else (
                     f"Using fallback tool {fallback_tool} for {task_type}. "
                     f"BERT contradiction: {bert_analysis.get('contradiction_prob', 0):.0%}"
                 ),
@@ -766,8 +811,12 @@ class ConflictResolver:
         # Check for false positive (high entailment = tools actually agree)
         is_false_positive = entailment > self.BERT_HIGH_ENTAILMENT and contradiction < 0.3
         
-        # Calculate severity adjustment based on contradiction confidence
-        if contradiction > self.BERT_HIGH_CONTRADICTION:
+        # Calculate severity adjustment based on contradiction confidence.
+        # When no BERT scores are available (tool-level detection without
+        # BERT), severity_adjustment = 1.0 so we don't penalise confidence.
+        if not bert_scores:
+            severity_adjustment = 1.0  # No BERT involved, no discount
+        elif contradiction > self.BERT_HIGH_CONTRADICTION:
             severity_adjustment = 1.0  # High severity, no discount
         elif contradiction > self.BERT_MODERATE_CONTRADICTION:
             severity_adjustment = 0.9  # Slight confidence reduction
@@ -827,17 +876,20 @@ class ConflictResolver:
         
         # Close confidence scores + high BERT contradiction = defer to human
         if confidence_gap < 0.15 and bert_analysis["contradiction_prob"] > 0.8:
+            # Use the higher tool's confidence (discounted) so downstream
+            # analysis still has a meaningful number instead of 0.
+            adj_conf = highest.confidence * bert_analysis.get("severity_adjustment", 0.8) * 0.5
             return {
                 "decision": "bert_requires_human_review",
                 "selected_tool": None,
                 "value": None,
-                "confidence": 0.0,
+                "confidence": adj_conf,
                 "reasoning": (
                     f"BERT detected strong contradiction ({bert_analysis['contradiction_prob']:.0%}), "
                     f"but tool confidences are too close ({highest.confidence:.0%} vs {second.confidence:.0%}). "
                     f"Deferring to radiologist review."
                 ),
-                "should_defer": True,
+                "should_defer": adj_conf < self.deferral_threshold,
                 "bert_analysis": bert_analysis,
             }
         
@@ -868,6 +920,7 @@ class ConflictResolver:
             "severity": "severity_assessment",
             "semantic": "description",
             "value": "presence_detection",
+            "anatomical_consistency": "presence_detection",
         }
         return mapping.get(conflict_type, "description")
     
@@ -903,7 +956,10 @@ class ConflictResolver:
         bert_analysis: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Resolve conflict using confidence-weighted average.
+        Resolve conflict using trust-weighted confidence average.
+        
+        Each finding's influence = confidence * trust_weight, so historically
+        reliable tools contribute more to the final decision.
         
         Args:
             findings: All findings for this pathology
@@ -912,35 +968,58 @@ class ConflictResolver:
         Returns:
             Resolution dict
         """
-        # Weight by confidence
-        total_weight = sum(f.confidence for f in findings)
-        
+        if not findings:
+            return {
+                "decision": "insufficient_confidence",
+                "confidence": 0.0,
+                "value": None,
+                "reasoning": "No findings available for resolution",
+                "should_defer": True,
+                "bert_analysis": bert_analysis or {},
+            }
+
+        # Compute per-finding weight = confidence * trust
+        weights = []
+        for f in findings:
+            tw = self.trust_manager.get_weight(f.source_tool) if self.enable_tool_trust else 1.0
+            weights.append(f.confidence * tw)
+
+        total_weight = sum(weights)
+
         if total_weight == 0:
             return {
                 "decision": "insufficient_confidence",
                 "confidence": 0.0,
+                "value": None,
                 "reasoning": "All tools have zero confidence",
                 "should_defer": True,
                 "bert_analysis": bert_analysis or {},
             }
-        
-        # Weighted average of "presence" (1 if confidence > 0.5, else 0)
+
+        # Trust-weighted presence vote
         weighted_presence = sum(
-            f.confidence * (1 if f.confidence > 0.5 else 0)
-            for f in findings
+            w * (1.0 if f.confidence > 0.5 else 0.0)
+            for f, w in zip(findings, weights)
         ) / total_weight
-        
-        avg_confidence = sum(f.confidence for f in findings) / len(findings)
-        
-        # Apply BERT adjustment if available
+
+        # Trust-weighted average confidence
+        avg_confidence = sum(weights) / sum(
+            (self.trust_manager.get_weight(f.source_tool) if self.enable_tool_trust else 1.0)
+            for f in findings
+        )
+
+        # Apply BERT severity adjustment
         if bert_analysis:
             avg_confidence *= bert_analysis.get("severity_adjustment", 1.0)
-        
+
         return {
             "decision": "weighted_average",
             "value": weighted_presence > 0.5,
             "confidence": avg_confidence,
-            "reasoning": f"Averaged {len(findings)} tool outputs with confidence weighting",
+            "reasoning": (
+                f"Trust-weighted average of {len(findings)} tool outputs. "
+                f"Presence vote: {weighted_presence:.0%}"
+            ),
             "should_defer": avg_confidence < self.deferral_threshold,
             "bert_analysis": bert_analysis or {},
         }

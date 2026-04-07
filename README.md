@@ -17,9 +17,10 @@
 - [Advanced: Conflict Detection \& Resolution Pipeline](#advanced-conflict-detection--resolution-pipeline)
   - [Pipeline Architecture](#pipeline-architecture)
   - [Layer 1: Conflict Detection](#layer-1-conflict-detection)
-    - [Semantic Conflict Detection via Natural Language Inference](#semantic-conflict-detection-via-natural-language-inference)
-    - [Rule-Based Confidence Gap Analysis](#rule-based-confidence-gap-analysis)
-    - [Anatomical Consistency Validation (GACL)](#anatomical-consistency-validation-gacl)
+    - [Stage 1: Deduplication](#stage-1-deduplication)
+    - [Stage 2: Tool-Level Comparison (Primary Detection)](#stage-2-tool-level-comparison-primary-detection)
+    - [Stage 3: BERT-NLI Semantic Enrichment](#stage-3-bert-nli-semantic-enrichment)
+    - [Anatomical Consistency Module (GACL)](#anatomical-consistency-module-gacl)
   - [Layer 2: Confidence Calibration and Fusion](#layer-2-confidence-calibration-and-fusion)
   - [Layer 3: Argumentation Graphs](#layer-3-argumentation-graphs)
   - [Layer 4: Tool Trust Management](#layer-4-tool-trust-management)
@@ -125,7 +126,7 @@ The pipeline processes tool outputs sequentially through five layers, where each
 
 | Layer | Component | Function | Core Technique |
 |:-----:|-----------|----------|----------------|
-| 1 | **Conflict Detection** | Identify disagreements across tool outputs | BERT-NLI semantic analysis + rule-based confidence gap |
+| 1 | **Conflict Detection** | Identify disagreements across tool outputs | Tool-level pairwise comparison + BERT-NLI enrichment |
 | 2 | **Confidence Calibration** | Normalize scores to a common probabilistic scale | Isotonic regression, temperature scaling, min-max normalization |
 | 3 | **Argumentation Graphs** | Structure conflicts as weighted support/attack graphs | Bipolar argumentation frameworks with cycle detection |
 | 4 | **Tool Trust Management** | Weight opinions by historically learned reliability | Bayesian performance tracking with persistent state |
@@ -137,27 +138,31 @@ The final output of the pipeline is a resolved finding accompanied by a calibrat
 
 ### Layer 1: Conflict Detection
 
-The first layer employs three complementary detection methods, applied in sequence to maximize both recall and precision of identified conflicts.
+The first layer uses a **tool-level pairwise comparison** strategy that guarantees at most $\binom{N}{2}$ conflicts when $N$ distinct tools are invoked. This bound prevents the combinatorial explosion that would occur if individual findings were compared pairwise (e.g., three classifier runs on three images producing 54 findings and hundreds of spurious conflicts). Detection proceeds in three stages:
 
-#### Semantic Conflict Detection via Natural Language Inference
+#### Stage 1: Deduplication
 
-The primary detection mechanism leverages a fine-tuned DeBERTa model (Microsoft DeBERTa-base-MNLI), trained on over 433,000 natural language inference examples from the MultiNLI and SNLI corpora. Given a pair of textual outputs from two different tools, the model classifies their relationship into one of three categories:
+When the same tool is called multiple times on different images (e.g., DenseNet-121 on three views of the same case), it produces multiple findings for each pathology. The detector retains only the highest-confidence entry per (tool, pathology) pair, collapsing redundant entries before any comparison occurs. Synthetic VQA cross-reference findings are calibrated: positive mentions are floored at 0.55 confidence and negative mentions are capped at 0.20, preventing uncalibrated VQA base-confidence values from triggering false conflicts.
 
-- **Contradiction**: The two statements are logically incompatible (e.g., *"pneumothorax present, occupying 15% of hemithorax"* versus *"no pneumothorax detected in this study"*). This triggers the full resolution pipeline.
-- **Entailment**: The statements express the same clinical finding, possibly in different terminology (e.g., *"pneumothorax present"* versus *"lung is collapsed"*). No conflict exists; outputs can be fused directly.
-- **Neutral**: The statements address different aspects of the image and neither support nor contradict each other. No direct conflict is raised.
+#### Stage 2: Tool-Level Comparison (Primary Detection)
 
-The NLI approach is critical because naive string-matching or keyword-based methods fail catastrophically on medical text, where synonyms, paraphrases, and terminology variations are pervasive. The model produces a full probability distribution over all three classes, and a conflict is flagged when the contradiction probability exceeds a configurable threshold (default: 0.6, tuned lower for medical text to improve recall on clinically significant disagreements).
+For each unordered pair of distinct tools, the detector identifies shared pathologies — those where both tools have reported an opinion. Among the shared pathologies, it finds the one with the **worst present-vs-absent disagreement**: where one tool's calibrated confidence exceeds 0.5 (indicating presence) and the other falls below 0.5 (indicating absence), and the absolute gap between their confidences is maximal. If this worst-case gap exceeds the configurable sensitivity threshold (default: 0.25), exactly one conflict is registered for that tool pair. The conflict captures the disagreeing pathology, both tools' names and confidence values, and a severity classification: **critical** when the gap exceeds 0.5, **moderate** when it exceeds 0.3, and **minor** otherwise.
 
-#### Rule-Based Confidence Gap Analysis
+This approach ensures that ordinary agreement between tools (which is the common case) produces zero conflicts, while genuine diagnostic disagreements are captured with minimal noise.
 
-When tools produce structured numerical outputs rather than free text — such as classification probability vectors — the system falls back to a computationally lightweight rule-based method. It computes the absolute difference between confidence scores assigned to the same finding by different tools. A presence conflict is registered when this gap exceeds a sensitivity threshold (default: 0.4) and the tools straddle the presence decision boundary (one tool reports confidence above 0.7, indicating presence, while another reports below 0.3, indicating absence). Conflicts are triaged into severity levels based on the strength of the disagreement: a conflict is classified as **critical** when the highest-confidence tool exceeds 0.85, and **moderate** otherwise. For BERT-detected semantic conflicts, severity is determined by the contradiction probability: above 0.85 is **critical**, between 0.7 and 0.85 is **moderate**, and below 0.7 is **minor**. This stratification directly influences how aggressively the downstream resolution layers handle the disagreement.
+#### Stage 3: BERT-NLI Semantic Enrichment
 
-#### Anatomical Consistency Validation (GACL)
+Once a conflict is identified by the rule-based detector, the system enriches it with semantic analysis from a fine-tuned DeBERTa model (Microsoft DeBERTa-base-MNLI), trained on over 433,000 natural language inference examples. The model classifies the textual relationship between the two conflicting findings into three categories:
 
-The third detection method operates at the domain-knowledge level using Graph-based Anatomical Consistency Logic (GACL). Rather than comparing tool outputs against each other, GACL validates whether the *combined set* of reported findings is physically plausible given known anatomical constraints.
+- **Contradiction**: The statements are logically incompatible (e.g., *"pneumothorax present, occupying 15% of hemithorax"* versus *"no pneumothorax detected"*).
+- **Entailment**: The statements express the same finding in different terminology. If BERT reports high entailment (>70%), the downstream resolver can dismiss the conflict as a false positive.
+- **Neutral**: The statements address different clinical aspects and neither support nor contradict each other.
 
-Each finding is represented along five universal attribute axes derived from radiology literature:
+The BERT probability distribution (contradiction, entailment, neutral) is attached to the Conflict object and flows into the resolution pipeline, where it influences severity classification — a BERT contradiction probability above 0.85 upgrades the conflict to **critical**, and above 0.70 upgrades **minor** to **moderate** — as well as the BERT-guided resolution strategy and the confidence adjustment applied to the final decision. This layered approach means BERT semantic analysis is always available to the resolver without inflating the conflict count.
+
+#### Anatomical Consistency Module (GACL)
+
+The system also includes a Graph-based Anatomical Consistency Logic (GACL) module that validates whether the combined set of reported findings is physically plausible. Each finding is represented along five universal, disease-agnostic attribute axes:
 
 - **Occupancy** — whether a finding is present or absent
 - **Aeration** — the degree of air presence (normal, decreased, absent)
@@ -165,7 +170,7 @@ Each finding is represented along five universal attribute axes derived from rad
 - **Volume Change** — size relative to normal (increased, decreased, normal)
 - **Mass Effect** — mechanical impact on surrounding structures (shift, compression, none)
 
-These axes are intentionally disease-agnostic: they describe any CXR abnormality without naming it, ensuring the system generalizes to novel pathologies without modification. GACL constructs a constraint graph over reported findings and checks for violations — for example, a region simultaneously reported as containing air-density pneumothorax and fluid-density consolidation represents a physical impossibility that would be flagged regardless of the individual tools' confidence levels.
+GACL constructs a constraint graph over reported findings and checks for violations — for example, a region simultaneously reported as containing air-density pneumothorax and fluid-density consolidation represents a physical impossibility. This module operates as a supporting consistency check available for cases involving segmentation and classification data.
 
 ---
 
@@ -245,7 +250,7 @@ To illustrate how these five layers interact in practice, consider a scenario wh
 
 The DenseNet-121 classifier reports cardiomegaly as present with 89% confidence. CheXagent reports it as absent with 75% confidence. LLaVA-Med generates a free-text report stating that "the cardiac silhouette is enlarged, consistent with cardiomegaly."
 
-**Layer 1** detects the conflict through two independent channels: the BERT-NLI model identifies a semantic contradiction between CheXagent's "absent" determination and LLaVA-Med's "enlarged cardiac silhouette" report (contradiction probability: 0.91), and the rule-based method flags the 0.64 confidence gap between DenseNet-121 and CheXagent as a moderate-severity conflict.
+**Layer 1** performs tool-level pairwise comparison. With three tools, there are at most $\binom{3}{2} = 3$ potential conflicts. For the DenseNet-121 vs CheXagent pair, cardiomegaly is the worst disagreement: DenseNet says present at 89% while CheXagent (inverted) says present at only 25% — a 0.64 gap that exceeds the 0.25 sensitivity threshold, producing one **moderate** conflict. BERT-NLI enriches this conflict with a contradiction probability of 0.91, upgrading it to **critical**. The other tool pairs (DenseNet vs LLaVA-Med, CheXagent vs LLaVA-Med) may also produce conflicts on cardiomegaly, but with aligned assessments they may fall below the threshold. The total conflict count is bounded at 3.
 
 **Layer 2** calibrates the raw scores. DenseNet-121's 0.89 is adjusted to 0.87 using its learned calibration curve (the model is known to be slightly overconfident). LLaVA-Med's textual output is mapped to a numerical confidence of 0.72 based on its language patterns. CheXagent's 0.75 confidence in absence is inverted to 0.25 confidence in presence.
 
@@ -253,7 +258,7 @@ The DenseNet-121 classifier reports cardiomegaly as present with 89% confidence.
 
 **Layer 4** confirms that DenseNet-121 carries the highest trust weight (0.92) based on 92 correct predictions out of 100 historical cases for cardiac pathology.
 
-**Layer 5** evaluates abstention criteria: three tools are reporting (sufficient), no cycles exist, the gap is 1.20 (well above 0.2), certainty is 0.88 (above both the general 0.6 and critical 0.8 thresholds). All criteria pass — the system proceeds with the resolution.
+**Layer 5** evaluates abstention criteria: three tools are reporting (sufficient), no cycles exist, the strength gap is 1.20 (well above the close-vote threshold), certainty is 0.88 (above both the general and critical thresholds). All criteria pass — the system proceeds with the resolution.
 
 The final output is: cardiomegaly **present**, calibrated confidence **0.84**, supported by DenseNet-121 and LLaVA-Med, opposed by CheXagent, with full reasoning trace and no human review required.
 
