@@ -1,5 +1,6 @@
 import os
 import warnings
+from pathlib import Path
 from typing import *
 from dotenv import load_dotenv
 from transformers import logging
@@ -11,11 +12,23 @@ from langchain_core.tools import BaseTool
 from interface import create_demo
 from medrax_premium.agent import *
 from medrax_premium.tools import *
+from medrax_premium.tools.grounding import XRayPhraseGroundingTool
 from medrax_premium.utils import *
+
+try:
+    from medrax_premium.tools.generation import ChestXRayGeneratorTool
+except Exception:
+    ChestXRayGeneratorTool = None
 
 warnings.filterwarnings("ignore")
 logging.set_verbosity_error()
 _ = load_dotenv()
+
+
+def _resolve_work_path(*parts):
+    """Return a writable path under the active work directory."""
+    work_root = Path(os.environ.get("WORK_DIR", "/kaggle/working"))
+    return work_root.joinpath(*parts)
 
 
 def _resolve_model(model_dir, local_subpath, hf_repo_id):
@@ -35,7 +48,7 @@ def initialize_agent(
     prompt_file,
     tools_to_use=None,
     model_dir="/model-weights",
-    temp_dir="temp",
+    temp_dir=None,
     device="cuda",
     model="chatgpt-4o-latest",
     temperature=0.7,
@@ -68,6 +81,17 @@ def initialize_agent(
     findings_id = _resolve_model(model_dir, "models-core/swinv2_findings", "IAMJB/chexpert-mimic-cxr-findings-baseline")
     impression_id = _resolve_model(model_dir, "models-core/swinv2_impression", "IAMJB/chexpert-mimic-cxr-impression-baseline")
 
+    if temp_dir is None:
+        temp_dir = _resolve_work_path("temp")
+    else:
+        temp_dir = Path(temp_dir)
+        if not temp_dir.is_absolute():
+            temp_dir = _resolve_work_path(str(temp_dir))
+
+    log_dir = _resolve_work_path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
     # --- GPU memory manager: only one heavy tool on GPU 1 at a time --------
     gpu1_mgr = GPUMemoryManager()
 
@@ -99,11 +123,13 @@ def initialize_agent(
             XRayPhraseGroundingTool, gpu1_mgr,
             model_path=maira_id, cache_dir=model_dir, temp_dir=temp_dir, load_in_4bit=True, device=device,
         ),
-        "ChestXRayGeneratorTool": LazyTool(
+    }
+
+    if ChestXRayGeneratorTool is not None:
+        lazy_tools["ChestXRayGeneratorTool"] = LazyTool(
             ChestXRayGeneratorTool, gpu1_mgr,
             model_path=f"{model_dir}/roentgen", temp_dir=temp_dir, device=device,
-        ),
-    }
+        )
 
     all_tools = {**eager_tools, **lazy_tools}
 
@@ -122,7 +148,7 @@ def initialize_agent(
         model,
         tools=list(tools_dict.values()),
         log_tools=True,
-        log_dir="logs",
+        log_dir=str(log_dir),
         system_prompt=prompt,
         checkpointer=checkpointer,
         enable_conflict_resolution=True,  # NEW: Enable conflict resolution framework
@@ -165,7 +191,7 @@ if __name__ == "__main__":
         "medrax_premium/docs/system_prompts.txt",
         tools_to_use=selected_tools,
         model_dir=os.environ.get("MODEL_DIR", "/model-weights"),
-        temp_dir="temp",
+        temp_dir=_resolve_work_path("temp"),
         device=os.environ.get("DEVICE", "cuda"),
         model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
         temperature=0.7,
