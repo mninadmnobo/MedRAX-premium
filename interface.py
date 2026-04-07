@@ -1,3 +1,5 @@
+import ast
+import json
 import re
 import base64
 import gradio as gr
@@ -6,6 +8,35 @@ import time
 import shutil
 from typing import AsyncGenerator, List, Optional, Tuple
 from gradio import ChatMessage
+
+
+def _safe_parse_tool_content(raw_content):
+    """Parse tool message content without using eval.
+
+    Returns the first structured item when content is list-like, or the parsed
+    object itself. Falls back to raw string when parsing fails.
+    """
+    if isinstance(raw_content, list):
+        return raw_content[0] if raw_content else None
+    if isinstance(raw_content, dict):
+        return raw_content
+    if not isinstance(raw_content, str):
+        return raw_content
+
+    text = raw_content.strip()
+    if not text:
+        return None
+
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            parsed = parser(text)
+            if isinstance(parsed, list):
+                return parsed[0] if parsed else None
+            return parsed
+        except Exception:
+            continue
+
+    return text
 
 
 class ChatInterface:
@@ -134,7 +165,7 @@ class ChatInterface:
                     elif "execute" in event:
                         for message in event["execute"]["messages"]:
                             tool_name = message.name
-                            tool_result = eval(message.content)[0]
+                            tool_result = _safe_parse_tool_content(message.content)
 
                             if tool_result:
                                 metadata = {"title": f"🖼️ Image from tool: {tool_name}"}
@@ -150,7 +181,11 @@ class ChatInterface:
                                     )
                                 )
                                 # For image_visualizer, use display path if available
-                                if tool_name == "image_visualizer" and "image_path" in tool_result:
+                                if (
+                                    tool_name == "image_visualizer"
+                                    and isinstance(tool_result, dict)
+                                    and "image_path" in tool_result
+                                ):
                                     self.display_file_path = tool_result["image_path"]
                                     chat_history.append(
                                         ChatMessage(

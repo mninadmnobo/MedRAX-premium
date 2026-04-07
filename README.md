@@ -294,6 +294,8 @@ or if you run into permission issues
 ```bash
 sudo -E env "PATH=$PATH" python main.py
 ```
+When running in Kaggle, copy the repository into `/kaggle/working` first and launch the app from that writable runtime directory.
+The `/kaggle/input` mount is read-only, so starting the app directly from the dataset path will fail.
 You need to setup the `model_dir` inside `main.py` to the directory where you want to download or already have the weights of above tools from Hugging Face.
 Comment out the tools that you do not have access to.
 Make sure to setup your OpenAI API key in `.env` file!

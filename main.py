@@ -38,9 +38,29 @@ def _resolve_model(model_dir, local_subpath, hf_repo_id):
       - Flat local directories (e.g. Kaggle datasets)
       - HF cache directories (original Docker / local dev setup)
     """
-    local = os.path.join(model_dir, local_subpath)
-    if os.path.isdir(local):
-        return local
+    target_parts = Path(local_subpath).parts
+
+    direct = Path(model_dir).joinpath(*target_parts)
+    if direct.is_dir():
+        return str(direct)
+
+    nested = direct.joinpath(*target_parts)
+    if nested.is_dir():
+        return str(nested)
+
+    search_roots = [Path(model_dir), Path("/kaggle/input"), Path("/kaggle/working")]
+    seen_roots = set()
+    for root in search_roots:
+        if not root.is_dir() or root in seen_roots:
+            continue
+        seen_roots.add(root)
+        try:
+            for candidate in root.rglob(target_parts[-1]):
+                if candidate.is_dir() and tuple(candidate.parts[-len(target_parts):]) == target_parts:
+                    return str(candidate)
+        except OSError:
+            pass
+
     return hf_repo_id
 
 
@@ -98,7 +118,7 @@ def initialize_agent(
     # Tools that are small / CPU-only — loaded eagerly on GPU 0
     eager_tools = {
         "ChestXRayClassifierTool": lambda: ChestXRayClassifierTool(device=device),
-        "ChestXRaySegmentationTool": lambda: ChestXRaySegmentationTool(device=device),
+        "ChestXRaySegmentationTool": lambda: ChestXRaySegmentationTool(device=device, temp_dir=temp_dir),
         "ChestXRayReportGeneratorTool": lambda: ChestXRayReportGeneratorTool(
             cache_dir=model_dir, device=device,
             findings_model_path=findings_id,
@@ -176,15 +196,22 @@ if __name__ == "__main__":
         "ChestXRaySegmentationTool",
         "ChestXRayReportGeneratorTool",
         "XRayVQATool",
-        # "LlavaMedTool",
+        "LlavaMedTool",
         # "XRayPhraseGroundingTool",
         # "ChestXRayGeneratorTool",
     ]    # Collect the ENV variables
     openai_kwargs = {}
-    if api_key := os.getenv("OPENAI_API_KEY"):
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    base_url = (os.getenv("OPENAI_BASE_URL") or "").strip()
+
+    if api_key:
         openai_kwargs["api_key"] = api_key
 
-    if base_url := os.getenv("OPENAI_BASE_URL"):
+    # GitHub PATs must target the GitHub Models inference endpoint.
+    if api_key.startswith(("github_", "ghp_", "github_pat_")) and not base_url:
+        base_url = "https://models.inference.ai.azure.com"
+
+    if base_url:
         openai_kwargs["base_url"] = base_url
 
     agent, tools_dict = initialize_agent(
